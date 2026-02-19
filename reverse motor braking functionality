@@ -1,0 +1,236 @@
+// ================================================================
+//  ROBOT TOUR — ESP32-S3 Lonely Binary + DRI0041 + FIT0186
+// ================================================================
+
+#define COUNTS_PER_REV     689.0f
+#define WHEEL_DIAMETER_CM  12.4f
+#define WHEELBASE_CM       23.2f
+
+// With reverse brake active, scale needs to be higher to compensate
+// 0.73 = 45deg with brake, so roughly doubling gets us to 90deg
+// Start at 1.10 and tune from there
+#define TURN_SCALE         1.10f
+
+#define MAX_SPEED      90
+#define MIN_SPEED      52
+#define CRAWL_SPEED    56
+#define RAMP_COUNTS    300
+#define CRAWL_COUNTS   250
+
+#define TURN_MAX_SPEED  75
+#define TURN_MIN_SPEED  45
+#define TURN_RAMP       80
+
+#define KP  4.0f
+#define KI  0.01f
+#define KD  1.0f
+
+#define PIN_ENA  4
+#define PIN_IN1  5
+#define PIN_IN2  6
+#define PIN_ENB  7
+#define PIN_IN3  15
+#define PIN_IN4  16
+#define HALL_1A  17
+#define HALL_1B  18
+#define HALL_2A  8
+#define HALL_2B  9
+
+volatile long enc1 = 0;
+volatile long enc2 = 0;
+
+void motorsBrake();
+void motorsReverseBrake(int d1a, int d1b, int d2a, int d2b);
+void fwd(float cm);
+void rev(float cm);
+void right(float deg);
+void left(float deg);
+void executeTurn(int d1a, int d1b, int d2a, int d2b, long t);
+long distToCounts(float cm);
+long angleToCounts(float deg);
+int rampedSpeed(long encAvg, long target);
+
+// ================================================================
+//  YOUR MISSION
+//
+//  fwd(cm)        forward
+//  rev(cm)        backward
+//  right(deg)     right turn
+//  left(deg)      left turn
+// ================================================================
+void runMission() {
+  delay(5000);
+  fwd(50);
+  right(90);
+  fwd(50);
+}
+// ================================================================
+
+void IRAM_ATTR isr1() { enc1++; }
+void IRAM_ATTR isr2() { enc2++; }
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("Booting...");
+
+  pinMode(PIN_IN1, OUTPUT);
+  pinMode(PIN_IN2, OUTPUT);
+  pinMode(PIN_IN3, OUTPUT);
+  pinMode(PIN_IN4, OUTPUT);
+
+  ledcAttach(PIN_ENA, 5000, 8);
+  ledcAttach(PIN_ENB, 5000, 8);
+
+  pinMode(HALL_1A, INPUT_PULLUP);
+  pinMode(HALL_1B, INPUT_PULLUP);
+  pinMode(HALL_2A, INPUT_PULLUP);
+  pinMode(HALL_2B, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(HALL_1A), isr1, RISING);
+  attachInterrupt(digitalPinToInterrupt(HALL_2A), isr2, RISING);
+
+  motorsBrake();
+  Serial.println("Mission starts in 5 seconds...");
+  runMission();
+  motorsBrake();
+  Serial.println("Done.");
+}
+
+void loop() {}
+
+long distToCounts(float cm) {
+  return (long)((cm / (PI * WHEEL_DIAMETER_CM)) * COUNTS_PER_REV);
+}
+
+long angleToCounts(float deg) {
+  return (long)(distToCounts(PI * WHEELBASE_CM * (deg / 360.0f)) * TURN_SCALE);
+}
+
+int rampedSpeed(long encAvg, long target) {
+  long remaining = target - encAvg;
+  if (remaining < CRAWL_COUNTS) {
+    float t = sin(((float)remaining / CRAWL_COUNTS) * (PI / 2.0f));
+    return (int)(CRAWL_SPEED + (MAX_SPEED - CRAWL_SPEED) * t);
+  }
+  if (encAvg < RAMP_COUNTS) {
+    float t = sin(((float)encAvg / RAMP_COUNTS) * (PI / 2.0f));
+    return (int)(MIN_SPEED + (MAX_SPEED - MIN_SPEED) * t);
+  }
+  return MAX_SPEED;
+}
+
+void motorsBrake() {
+  ledcWrite(PIN_ENA, 255);
+  ledcWrite(PIN_ENB, 255);
+  digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, LOW);
+  delay(150);
+  ledcWrite(PIN_ENA, 0);
+  ledcWrite(PIN_ENB, 0);
+}
+
+void motorsReverseBrake(int d1a, int d1b, int d2a, int d2b) {
+  digitalWrite(PIN_IN1, d1a); digitalWrite(PIN_IN2, d1b);
+  digitalWrite(PIN_IN3, d2a); digitalWrite(PIN_IN4, d2b);
+  ledcWrite(PIN_ENA, 80);
+  ledcWrite(PIN_ENB, 80);
+  delay(60);
+  motorsBrake();
+}
+
+void fwd(float cm) {
+  long t = distToCounts(cm);
+  enc1 = 0; enc2 = 0;
+  Serial.print("fwd "); Serial.print(cm); Serial.print("cm counts="); Serial.println(t);
+
+  digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, HIGH);
+  digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);
+
+  int lastSpd = MIN_SPEED;
+  while (((enc1 + enc2) / 2) < t) {
+    long avg = (enc1 + enc2) / 2;
+    lastSpd = rampedSpeed(avg, t);
+    ledcWrite(PIN_ENA, lastSpd);
+    ledcWrite(PIN_ENB, lastSpd);
+  }
+
+  motorsReverseBrake(HIGH, LOW, LOW, HIGH);
+  delay(200);
+}
+
+void rev(float cm) {
+  long t = distToCounts(cm);
+  enc1 = 0; enc2 = 0;
+  Serial.print("rev "); Serial.print(cm); Serial.print("cm counts="); Serial.println(t);
+
+  digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, HIGH);
+
+  int lastSpd = MIN_SPEED;
+  while (((enc1 + enc2) / 2) < t) {
+    long avg = (enc1 + enc2) / 2;
+    lastSpd = rampedSpeed(avg, t);
+    ledcWrite(PIN_ENA, lastSpd);
+    ledcWrite(PIN_ENB, lastSpd);
+  }
+
+  motorsReverseBrake(LOW, HIGH, HIGH, LOW);
+  delay(200);
+}
+
+void executeTurn(int d1a, int d1b, int d2a, int d2b, long t) {
+  enc1 = 0; enc2 = 0;
+
+  float integral  = 0.0f;
+  float lastError = 0.0f;
+
+  digitalWrite(PIN_IN1, d1a); digitalWrite(PIN_IN2, d1b);
+  digitalWrite(PIN_IN3, d2a); digitalWrite(PIN_IN4, d2b);
+
+  while (((enc1 + enc2) / 2) < t) {
+    long avg = (enc1 + enc2) / 2;
+
+    float frac = 0.0f;
+    if (avg < TURN_RAMP) {
+      frac = sin(((float)avg / TURN_RAMP) * (PI / 2.0f));
+    } else {
+      long remaining = t - avg;
+      if (remaining < TURN_RAMP && remaining >= 0)
+        frac = sin(((float)remaining / TURN_RAMP) * (PI / 2.0f));
+      else
+        frac = 1.0f;
+    }
+    int baseSpeed = (int)(TURN_MIN_SPEED + (TURN_MAX_SPEED - TURN_MIN_SPEED) * frac);
+
+    float error      = (float)(enc1 - enc2);
+    integral        += error;
+    integral         = constrain(integral, -100.0f, 100.0f);
+    float derivative = error - lastError;
+    lastError        = error;
+
+    float correction = (KP * error) + (KI * integral) + (KD * derivative);
+
+    int spd1 = constrain((int)(baseSpeed - correction), TURN_MIN_SPEED, TURN_MAX_SPEED);
+    int spd2 = constrain((int)(baseSpeed + correction), TURN_MIN_SPEED, TURN_MAX_SPEED);
+
+    ledcWrite(PIN_ENA, spd1);
+    ledcWrite(PIN_ENB, spd2);
+  }
+
+  // reverse brake for turns too — same consistent stop
+  motorsReverseBrake(!d1a, !d1b, !d2a, !d2b);
+  delay(200);
+}
+
+void right(float deg) {
+  long t = angleToCounts(deg);
+  Serial.print("right "); Serial.print(deg); Serial.print("deg counts="); Serial.println(t);
+  executeTurn(HIGH, LOW, HIGH, LOW, t);
+}
+
+void left(float deg) {
+  long t = angleToCounts(deg);
+  Serial.print("left "); Serial.print(deg); Serial.print("deg counts="); Serial.println(t);
+  executeTurn(LOW, HIGH, LOW, HIGH, t);
+}
