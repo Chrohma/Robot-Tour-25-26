@@ -1,0 +1,543 @@
+// ================================================================
+//  ROBOT TOUR — ESP32-S3 + DRI0041 + FIT0186 + BNO055 IMU
+//  v3 — fixed reverse correction, gentle braking, boot-dump logging
+// ================================================================
+//
+//  LOGGING WORKFLOW:
+//    1. Upload code with USB connected — log from last run auto-dumps
+//    2. Unplug USB, place robot on floor
+//    3. Robot waits 5s then runs mission (logs to flash)
+//    4. After mission: plug USB, press RESET, open Serial Monitor
+//    5. Log auto-dumps. Type 'c'+Enter to clear before next run.
+//
+//  MOTOR MAPPING (verified from original working turn code):
+//    Motor 1  (ENA, IN1, IN2)  =  RIGHT wheel
+//    Motor 2  (ENB, IN3, IN4)  =  LEFT  wheel
+//    Motor 1 forward: IN1=LOW,  IN2=HIGH
+//    Motor 2 forward: IN3=HIGH, IN4=LOW
+//
+//  BNO055 heading increases CLOCKWISE (compass convention).
+//
+// ================================================================
+
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+#include <LittleFS.h>
+
+// ======================== ROBOT GEOMETRY ========================
+#define COUNTS_PER_REV     700.0f
+#define WHEEL_DIAMETER_CM  12.4f
+#define WHEELBASE_CM       23.2f
+
+// ======================== SPEED PROFILES ========================
+#define MAX_SPEED       90
+#define MIN_SPEED       52
+#define CRAWL_SPEED     56
+#define RAMP_COUNTS     300
+#define CRAWL_COUNTS    250
+
+#define TURN_MAX_SPEED  75
+#define TURN_MIN_SPEED  40
+#define TURN_CRAWL      42
+
+// ==================== IMU HEADING PID (STRAIGHT) ================
+#define STRAIGHT_KP   6.0f
+#define STRAIGHT_KI   0.02f
+#define STRAIGHT_KD   3.0f
+
+// ==================== IMU TURN CONTROL ==========================
+#define TURN_KP             1.8f
+#define TURN_TOLERANCE      1.2f
+#define TURN_FINE_TOL       0.8f
+#define TURN_FINE_ATTEMPTS  6
+#define TURN_TIMEOUT_MS     3000
+
+// ======================== PIN MAPPING ===========================
+#define PIN_ENA  4
+#define PIN_IN1  5
+#define PIN_IN2  6
+#define PIN_ENB  7
+#define PIN_IN3  15
+#define PIN_IN4  16
+#define HALL_1A  17
+#define HALL_1B  18
+#define HALL_2A  8
+#define HALL_2B  9
+#define IMU_SDA  21
+#define IMU_SCL  47
+
+// ======================== GLOBALS ===============================
+volatile long encRight = 0;
+volatile long encLeft  = 0;
+
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+
+// ======================== FLASH LOGGING =========================
+File logFile;
+
+void logMsg(const char* fmt, ...) {
+  char buf[200];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  if (logFile) {
+    logFile.print(buf);
+    logFile.flush();
+  }
+}
+
+// Dump previous run's log over Serial (called at boot)
+void dumpLog() {
+  File f = LittleFS.open("/log.txt", "r");
+  if (!f || f.size() == 0) {
+    Serial.println("[No log from previous run]");
+    if (f) f.close();
+    return;
+  }
+  Serial.println("========== MISSION LOG ==========");
+  while (f.available()) {
+    Serial.write(f.read());
+  }
+  Serial.println("========== END LOG ==============");
+  Serial.println("Type 'c' to clear log before next run.");
+  f.close();
+}
+
+// ======================== PROTOTYPES ============================
+float getHeading();
+float angleDiff(float target, float current);
+void  setMotorSpeeds(int leftPWM, int rightPWM);
+void  motorsBrake();
+void  gentleStop();
+void  fwd(float cm);
+void  rev(float cm);
+void  right(float deg);
+void  left(float deg);
+void  turnToHeading(float targetHeading);
+long  distToCounts(float cm);
+int   rampedSpeed(long encAvg, long target);
+void  waitForIMUCalibration();
+
+// ================================================================
+//  YOUR MISSION
+// ================================================================
+void runMission() {
+  delay(2000);
+  fwd(25);
+  right(90);
+  fwd(50);
+  left(90);
+  fwd(150);
+  right(90);
+  fwd(50);
+  rev(150);
+  right(90);
+  fwd(150);
+  right(90);
+  fwd(50);
+  rev(50);
+  right(90);
+  fwd(150);
+}
+
+// ======================== ENCODER ISRs ==========================
+void IRAM_ATTR isrRight() { encRight++; }
+void IRAM_ATTR isrLeft()  { encLeft++;  }
+
+// ================================================================
+//  SETUP
+// ================================================================
+void setup() {
+  Serial.begin(115200);
+
+  // Give Serial time to connect (works when USB is plugged in)
+  unsigned long serialWait = millis();
+  while (!Serial && millis() - serialWait < 3000) {
+    delay(10);
+  }
+
+  // --- LittleFS ---
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed!");
+  }
+
+  // --- Dump previous log on boot ---
+  if (Serial) {
+    dumpLog();
+
+    // Give user 3 seconds to type 'c' to clear
+    unsigned long clearWait = millis();
+    while (millis() - clearWait < 3000) {
+      if (Serial.available()) {
+        char c = Serial.read();
+        if (c == 'c' || c == 'C') {
+          LittleFS.remove("/log.txt");
+          Serial.println("Log cleared.");
+        }
+      }
+      delay(10);
+    }
+  }
+
+  // --- Open fresh log for this run ---
+  logFile = LittleFS.open("/log.txt", "w");
+  logMsg("=== New mission ===\n");
+
+  // --- Motor pins ---
+  pinMode(PIN_IN1, OUTPUT);
+  pinMode(PIN_IN2, OUTPUT);
+  pinMode(PIN_IN3, OUTPUT);
+  pinMode(PIN_IN4, OUTPUT);
+  ledcAttach(PIN_ENA, 5000, 8);
+  ledcAttach(PIN_ENB, 5000, 8);
+
+  // --- Encoder pins ---
+  pinMode(HALL_1A, INPUT_PULLUP);
+  pinMode(HALL_1B, INPUT_PULLUP);
+  pinMode(HALL_2A, INPUT_PULLUP);
+  pinMode(HALL_2B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(HALL_1A), isrRight, RISING);
+  attachInterrupt(digitalPinToInterrupt(HALL_2A), isrLeft,  RISING);
+
+  // --- IMU init ---
+  Wire.begin(IMU_SDA, IMU_SCL);
+  if (!bno.begin()) {
+    logMsg("ERROR: BNO055 not found!\n");
+    Serial.println("ERROR: BNO055 not found! Check wiring.");
+    if (logFile) logFile.close();
+    while (1) { delay(100); }
+  }
+  bno.setExtCrystalUse(true);
+
+  logMsg("Waiting for IMU calibration...\n");
+  waitForIMUCalibration();
+  logMsg("IMU calibrated.\n");
+
+  motorsBrake();
+
+  float startHeading = getHeading();
+  logMsg("Initial heading: %.1f\n", startHeading);
+  logMsg("Mission starting in 5 seconds...\n");
+  Serial.println("Mission starting in 5 seconds...");
+
+  delay(5000);
+
+  runMission();
+
+  motorsBrake();
+  logMsg("Mission complete.\n");
+  if (logFile) logFile.close();
+
+  Serial.println("Mission done. Reset with USB to read log.");
+}
+
+void loop() {
+  delay(100);
+}
+
+// ================================================================
+//  IMU HELPERS
+// ================================================================
+float getHeading() {
+  sensors_event_t event;
+  bno.getEvent(&event);
+  return event.orientation.x;
+}
+
+// Positive = target is CW from current = turn RIGHT needed
+// Negative = target is CCW from current = turn LEFT needed
+float angleDiff(float target, float current) {
+  float diff = target - current;
+  while (diff > 180.0f)  diff -= 360.0f;
+  while (diff < -180.0f) diff += 360.0f;
+  return diff;
+}
+
+void waitForIMUCalibration() {
+  uint8_t sys, gyro, accel, mag;
+  unsigned long start = millis();
+
+  while (true) {
+    bno.getCalibration(&sys, &gyro, &accel, &mag);
+    logMsg("  Cal sys=%d gyro=%d accel=%d mag=%d\n", sys, gyro, accel, mag);
+
+    if (gyro >= 2) break;
+
+    if (millis() - start > 15000) {
+      logMsg("  WARNING: partial calibration\n");
+      break;
+    }
+    delay(500);
+  }
+}
+
+// ================================================================
+//  MOTOR CONTROL
+// ================================================================
+//  leftPWM  → Motor 2 (ENB, IN3, IN4)
+//  rightPWM → Motor 1 (ENA, IN1, IN2)
+void setMotorSpeeds(int leftPWM, int rightPWM) {
+  // LEFT wheel = Motor 2
+  if (leftPWM >= 0) {
+    digitalWrite(PIN_IN3, HIGH);
+    digitalWrite(PIN_IN4, LOW);
+  } else {
+    digitalWrite(PIN_IN3, LOW);
+    digitalWrite(PIN_IN4, HIGH);
+  }
+  ledcWrite(PIN_ENB, constrain(abs(leftPWM), 0, 255));
+
+  // RIGHT wheel = Motor 1
+  if (rightPWM >= 0) {
+    digitalWrite(PIN_IN1, LOW);
+    digitalWrite(PIN_IN2, HIGH);
+  } else {
+    digitalWrite(PIN_IN1, HIGH);
+    digitalWrite(PIN_IN2, LOW);
+  }
+  ledcWrite(PIN_ENA, constrain(abs(rightPWM), 0, 255));
+}
+
+// Full electrical brake — both pins LOW, PWM high
+void motorsBrake() {
+  digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, LOW);
+  ledcWrite(PIN_ENA, 255);
+  ledcWrite(PIN_ENB, 255);
+  delay(80);
+  ledcWrite(PIN_ENA, 0);
+  ledcWrite(PIN_ENB, 0);
+}
+
+// Gentle deceleration: ramp PWM down over ~150ms, then brake
+// This avoids the jerk/twist that a sudden reverse pulse causes
+void gentleStop() {
+  // Read current approximate speed from ramp (we just use a fixed ramp-down)
+  for (int pwm = 60; pwm >= 0; pwm -= 10) {
+    ledcWrite(PIN_ENA, pwm);
+    ledcWrite(PIN_ENB, pwm);
+    delay(20);
+  }
+  // Brief electrical brake to lock in place
+  digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, LOW);
+  ledcWrite(PIN_ENA, 200);
+  ledcWrite(PIN_ENB, 200);
+  delay(60);
+  ledcWrite(PIN_ENA, 0);
+  ledcWrite(PIN_ENB, 0);
+}
+
+// ================================================================
+//  DISTANCE HELPERS
+// ================================================================
+long distToCounts(float cm) {
+  return (long)((cm / (PI * WHEEL_DIAMETER_CM)) * COUNTS_PER_REV);
+}
+
+int rampedSpeed(long encAvg, long target) {
+  long remaining = target - encAvg;
+
+  if (remaining < CRAWL_COUNTS) {
+    float t = sin(((float)remaining / CRAWL_COUNTS) * (PI / 2.0f));
+    return (int)(CRAWL_SPEED + (MAX_SPEED - CRAWL_SPEED) * t);
+  }
+  if (encAvg < RAMP_COUNTS) {
+    float t = sin(((float)encAvg / RAMP_COUNTS) * (PI / 2.0f));
+    return (int)(MIN_SPEED + (MAX_SPEED - MIN_SPEED) * t);
+  }
+  return MAX_SPEED;
+}
+
+// ================================================================
+//  FORWARD — encoders for distance, IMU for heading
+// ================================================================
+//
+//  Drift RIGHT → heading increases → angleDiff negative
+//    → correction negative → left slower, right faster
+//    → steers LEFT → corrects ✓
+//
+void fwd(float cm) {
+  long target = distToCounts(cm);
+  encRight = 0;
+  encLeft  = 0;
+
+  float targetHeading = getHeading();
+  float integral  = 0.0f;
+  float lastError = 0.0f;
+
+  logMsg("fwd %.1f cm  counts=%ld  hdg=%.1f\n", cm, target, targetHeading);
+
+  unsigned long lastLoop = micros();
+
+  while (((encRight + encLeft) / 2) < target) {
+    unsigned long now = micros();
+    float dt = (now - lastLoop) / 1000000.0f;
+    if (dt < 0.005f) continue;
+    lastLoop = now;
+
+    long avg = (encRight + encLeft) / 2;
+    int baseSpeed = rampedSpeed(avg, target);
+
+    float headingError = angleDiff(targetHeading, getHeading());
+
+    integral += headingError * dt;
+    integral  = constrain(integral, -30.0f, 30.0f);
+    float derivative = (dt > 0) ? (headingError - lastError) / dt : 0.0f;
+    lastError = headingError;
+
+    float correction = (STRAIGHT_KP * headingError)
+                     + (STRAIGHT_KI * integral)
+                     + (STRAIGHT_KD * derivative);
+
+    int leftPWM  = constrain(baseSpeed + (int)correction, MIN_SPEED, MAX_SPEED);
+    int rightPWM = constrain(baseSpeed - (int)correction, MIN_SPEED, MAX_SPEED);
+
+    setMotorSpeeds(leftPWM, rightPWM);
+  }
+
+  gentleStop();
+  logMsg("  fwd done hdg=%.1f (target=%.1f)\n", getHeading(), targetHeading);
+  delay(150);
+}
+
+// ================================================================
+//  REVERSE — encoders for distance, IMU for heading
+// ================================================================
+//
+//  KEY FIX: Correction sign is FLIPPED vs forward.
+//
+//  Why: When reversing, if the robot's PATH curves right,
+//  the front/heading actually swings LEFT (heading decreases).
+//  angleDiff returns POSITIVE. With forward's formula that would
+//  speed up the left wheel — but in reverse, a faster left wheel
+//  pulls the back MORE to the right, making it worse.
+//
+//  Fix: subtract correction from left, add to right (opposite of fwd).
+//
+//  Drift right (path curves right) → heading decreases → angleDiff positive
+//    → correction positive
+//    → leftPWM = base - positive = slower backward
+//    → rightPWM = base + positive = faster backward
+//    → right wheel pulls back harder → back goes LEFT → corrects ✓
+//
+void rev(float cm) {
+  long target = distToCounts(cm);
+  encRight = 0;
+  encLeft  = 0;
+
+  float targetHeading = getHeading();
+  float integral  = 0.0f;
+  float lastError = 0.0f;
+
+  logMsg("rev %.1f cm  counts=%ld  hdg=%.1f\n", cm, target, targetHeading);
+
+  unsigned long lastLoop = micros();
+
+  while (((encRight + encLeft) / 2) < target) {
+    unsigned long now = micros();
+    float dt = (now - lastLoop) / 1000000.0f;
+    if (dt < 0.005f) continue;
+    lastLoop = now;
+
+    long avg = (encRight + encLeft) / 2;
+    int baseSpeed = rampedSpeed(avg, target);
+
+    float headingError = angleDiff(targetHeading, getHeading());
+
+    integral += headingError * dt;
+    integral  = constrain(integral, -30.0f, 30.0f);
+    float derivative = (dt > 0) ? (headingError - lastError) / dt : 0.0f;
+    lastError = headingError;
+
+    float correction = (STRAIGHT_KP * headingError)
+                     + (STRAIGHT_KI * integral)
+                     + (STRAIGHT_KD * derivative);
+
+    // FLIPPED vs forward: subtract from left, add to right
+    int leftPWM  = constrain(baseSpeed - (int)correction, MIN_SPEED, MAX_SPEED);
+    int rightPWM = constrain(baseSpeed + (int)correction, MIN_SPEED, MAX_SPEED);
+
+    setMotorSpeeds(-leftPWM, -rightPWM);
+  }
+
+  gentleStop();
+  logMsg("  rev done hdg=%.1f (target=%.1f)\n", getHeading(), targetHeading);
+  delay(150);
+}
+
+// ================================================================
+//  TURN TO HEADING — IMU-guided with fine correction
+// ================================================================
+void turnToHeading(float targetHeading) {
+  logMsg("  turnTo target=%.1f cur=%.1f\n", targetHeading, getHeading());
+
+  // --- PHASE 1: Main rotation ---
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < TURN_TIMEOUT_MS) {
+    float error = angleDiff(targetHeading, getHeading());
+
+    if (fabsf(error) < TURN_TOLERANCE) break;
+
+    int speed = constrain(
+      (int)(TURN_MIN_SPEED + fabsf(error) * TURN_KP),
+      TURN_MIN_SPEED,
+      TURN_MAX_SPEED
+    );
+
+    if (error > 0) {
+      setMotorSpeeds(speed, -speed);   // Right turn
+    } else {
+      setMotorSpeeds(-speed, speed);   // Left turn
+    }
+
+    delay(5);
+  }
+
+  motorsBrake();
+  delay(120);
+
+  // --- PHASE 2: Fine correction pulses ---
+  for (int attempt = 0; attempt < TURN_FINE_ATTEMPTS; attempt++) {
+    float error = angleDiff(targetHeading, getHeading());
+
+    logMsg("  fine #%d err=%.2f\n", attempt, error);
+
+    if (fabsf(error) < TURN_FINE_TOL) break;
+
+    int pulseMs = constrain((int)(fabsf(error) * 8), 15, 60);
+
+    if (error > 0) {
+      setMotorSpeeds(TURN_CRAWL, -TURN_CRAWL);
+    } else {
+      setMotorSpeeds(-TURN_CRAWL, TURN_CRAWL);
+    }
+    delay(pulseMs);
+    motorsBrake();
+    delay(120);
+  }
+
+  logMsg("  turn done hdg=%.1f (target=%.1f)\n", getHeading(), targetHeading);
+  delay(100);
+}
+
+// ================================================================
+//  RIGHT / LEFT
+// ================================================================
+void right(float deg) {
+  float current = getHeading();
+  float target = fmod(current + deg + 360.0f, 360.0f);
+  logMsg("right %.1f from=%.1f to=%.1f\n", deg, current, target);
+  turnToHeading(target);
+}
+
+void left(float deg) {
+  float current = getHeading();
+  float target = fmod(current - deg + 360.0f, 360.0f);
+  logMsg("left %.1f from=%.1f to=%.1f\n", deg, current, target);
+  turnToHeading(target);
+}
