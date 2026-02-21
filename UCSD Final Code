@@ -1,0 +1,548 @@
+// ================================================================
+//  ROBOT TOUR v6.2 — Encoder turns + separate L/R factors
+//  IMU used ONLY for post-turn measurement (not during turn)
+// ================================================================
+
+#include <Wire.h>
+
+// ======================== IMU REGISTERS =========================
+#define IMU_ADDR    0x6A
+#define REG_CTRL1   0x10
+#define REG_CTRL2   0x11
+#define REG_OUTZ_L  0x26
+#define REG_OUTZ_H  0x27
+#define GYRO_SENS   0.00875f
+
+// ======================== ROBOT GEOMETRY ========================
+#define COUNTS_PER_REV_STRAIGHT  550.0f   // for fwd/rev distance
+#define COUNTS_PER_REV_TURN     350.0f   // for turns (already tuned)
+#define WHEEL_DIAMETER_CM  12.4f
+#define WHEELBASE_CM       23.2f
+
+// ======================== STRAIGHT SPEED ========================
+#define MAX_SPEED         30
+#define MIN_SPEED         15
+#define CRAWL_SPEED       18
+#define RAMP_COUNTS       300
+#define CRAWL_COUNTS      350
+
+// ======================== TURN SPEED ============================
+#define TURN_MAX_SPEED    35
+#define TURN_MIN_SPEED    25
+#define TURN_CRAWL        29
+#define TURN_CRAWL_COUNTS 180
+
+// ==================== SEPARATE L/R TURN FACTORS =================
+// Right was 15 deg short: 1.23 * (90/75) = 1.476
+// Left  was 11 deg short: 1.23 * (90/79) = 1.401
+// Tune: if turn overshoots, nudge down 0.02. Undershoots, nudge up 0.02.
+//#define 1.476f
+//#define TURN_FACTOR_LEFT   1.401f
+#define TURN_FACTOR_RIGHT  1.75f
+#define TURN_FACTOR_LEFT   1.75f
+
+// ==================== ENCODER DIFFERENTIAL ======================
+#define DIFF_KP           1.5f
+#define DIFF_DEADBAND     2
+#define DIFF_STOP_MAX     5
+
+// ==================== Drift correction ======================
+// Positive value = slow down LEFT motor by this much PWM
+// Negative value = slow down RIGHT motor
+// Start with 2, increase if still drifting left, decrease if overcorrected
+#define STRAIGHT_TRIM     -1
+
+// ==================== GYRO SETTINGS ============================
+#define GYRO_BIAS_INITIAL     -1.400f
+#define GYRO_RECAL_SAMPLES    50
+#define SETTLE_THRESHOLD_DPS  0.15f
+#define SETTLE_TIMEOUT_MS     500
+#define SETTLE_PWM            28
+
+// ======================== PIN MAPPING ===========================
+#define PIN_ENA   9
+#define PIN_IN1   4
+#define PIN_IN2   7
+#define PIN_ENB   10
+#define PIN_IN3   11
+#define PIN_IN4   12
+#define HALL_1A   2
+#define HALL_2A   8
+
+// ======================== GLOBALS ===============================
+volatile long encRight = 0;
+volatile long encLeft  = 0;
+
+bool  imuOK     = false;
+float gyroBiasZ = GYRO_BIAS_INITIAL;
+
+// ======================== ENCODER ISRs ==========================
+void isrRight() { encRight++; }
+void isrLeft()  { encLeft++;  }
+
+// ================================================================
+//  YOUR MISSION
+// ================================================================
+void runMission() {
+/*  d(2);
+  fwd(50);
+  d(2);
+  fwd(5);
+  d(2);
+  right(90);
+  d(2);
+  fwd(25);
+  d(2);
+  rev(50);
+  d(2);
+  rev(50);
+  d(2);
+  rev(25);
+  d(2);
+  left(90);
+  d(2);
+  fwd(100);
+  d(2);
+  rev(50);
+  d(2);
+  right(90);
+  d(2);
+  fwd(25);
+  d(2);
+  left(90);
+  d(2);
+  fwd(50);
+  d(2);
+  fwd(50);
+  d(2);
+  right(90);
+  d(2);
+  fwd(110);
+  d(2);
+  rev(10);
+  d(2);
+  right(90);
+  d(2);
+  fwd(25); */
+
+  fwd(50);
+   d(2);
+  right(90);
+   d(10);
+  fwd(56);
+
+}
+
+// ================================================================
+//  SETUP
+// ================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(3000);
+  Serial.println("=== Robot Tour v6.2 (Encoder Turns, IMU Post-Check) ===");
+
+  pinMode(PIN_IN1, OUTPUT);
+  pinMode(PIN_IN2, OUTPUT);
+  pinMode(PIN_IN3, OUTPUT);
+  pinMode(PIN_IN4, OUTPUT);
+
+  pinMode(HALL_1A, INPUT_PULLUP);
+  pinMode(HALL_2A, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(HALL_1A), isrRight, RISING);
+  attachInterrupt(digitalPinToInterrupt(HALL_2A), isrLeft,  RISING);
+
+  analogWrite(PIN_ENA, 0);
+  analogWrite(PIN_ENB, 0);
+
+  Wire.begin();
+  imuOK = imuInit();
+  if (!imuOK) {
+    Serial.println("WARNING: IMU init failed.");
+  } else {
+    Serial.println("IMU ready. Calibrating bias — keep still...");
+    recalibrateGyroBias();
+    Serial.print("Initial bias: "); Serial.print(gyroBiasZ, 4);
+    Serial.println(" deg/s");
+  }
+
+  Serial.println("Mission starting in 5 seconds...");
+  d(5);
+  runMission();
+  analogWrite(PIN_ENA, 0);
+  analogWrite(PIN_ENB, 0);
+  Serial.println("Mission complete.");
+}
+
+void loop() { delay(100); }
+
+// ================================================================
+//  IMU FUNCTIONS
+// ================================================================
+bool imuInit() {
+  byte id = imuReadReg(0x0F);
+  if (id != 0x6A && id != 0x69) {
+    Serial.print("IMU WHO_AM_I unexpected: 0x");
+    Serial.println(id, HEX);
+    return false;
+  }
+  imuWriteReg(REG_CTRL2, 0x40);
+  imuWriteReg(REG_CTRL1, 0x40);
+  delay(50);
+  return true;
+}
+
+void imuWriteReg(byte reg, byte val) {
+  Wire.beginTransmission(IMU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+byte imuReadReg(byte reg) {
+  Wire.beginTransmission(IMU_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(IMU_ADDR, (byte)1);
+  if (Wire.available()) return Wire.read();
+  return 0;
+}
+
+float readGyroZ_raw() {
+  byte lo = imuReadReg(REG_OUTZ_L);
+  byte hi = imuReadReg(REG_OUTZ_H);
+  int16_t raw = (int16_t)((hi << 8) | lo);
+  return raw * GYRO_SENS;
+}
+
+float readGyroZ_dps() {
+  return readGyroZ_raw() - gyroBiasZ;
+}
+
+// ================================================================
+//  RECALIBRATE GYRO BIAS
+// ================================================================
+void recalibrateGyroBias() {
+  if (!imuOK) return;
+  double sum = 0.0;
+  for (int i = 0; i < GYRO_RECAL_SAMPLES; i++) {
+    sum += readGyroZ_raw();
+    delay(10);
+  }
+  gyroBiasZ = (float)(sum / GYRO_RECAL_SAMPLES);
+  Serial.print("  Bias updated: "); Serial.print(gyroBiasZ, 4);
+  Serial.println(" deg/s");
+}
+
+// ================================================================
+//  MEASURE ANGLE WITH GYRO (motors OFF only)
+//  Call this right after a turn stops to see actual angle turned.
+//  Integrates for the given ms while robot coasts to a stop.
+// ================================================================
+float measurePostTurnAngle(unsigned long durationMs) {
+  if (!imuOK) return 0.0f;
+  float angle = 0.0f;
+  unsigned long lastTime = millis();
+  unsigned long start = lastTime;
+  while (millis() - start < durationMs) {
+    unsigned long now = millis();
+    float dt = (now - lastTime) / 1000.0f;
+    lastTime = now;
+    float rate = readGyroZ_dps();
+    angle += rate * dt;
+    delay(5);
+  }
+  return angle;
+}
+
+// ================================================================
+//  SETTLE AFTER STOP
+// ================================================================
+void settleAfterStop() {
+  if (!imuOK) return;
+  unsigned long start = millis();
+  while (millis() - start < SETTLE_TIMEOUT_MS) {
+    float rateZ = readGyroZ_dps();
+    if (fabsf(rateZ) < SETTLE_THRESHOLD_DPS) break;
+    if (rateZ > 0) {
+      setMotorSpeeds( SETTLE_PWM, -SETTLE_PWM);
+    } else {
+      setMotorSpeeds(-SETTLE_PWM,  SETTLE_PWM);
+    }
+    delay(20);
+    analogWrite(PIN_ENA, 0);
+    analogWrite(PIN_ENB, 0);
+    delay(80);
+  }
+  analogWrite(PIN_ENA, 0);
+  analogWrite(PIN_ENB, 0);
+}
+
+// ================================================================
+//  DELAY HELPER
+// ================================================================
+void d(float seconds) {
+  unsigned long ms      = (unsigned long)(seconds * 1000.0f);
+  unsigned long recalMs = (unsigned long)(GYRO_RECAL_SAMPLES * 10);
+  if (imuOK && ms > recalMs + 100) {
+    delay(ms - recalMs);
+    recalibrateGyroBias();
+  } else {
+    delay(ms);
+  }
+}
+
+// ================================================================
+//  MOTOR CONTROL
+// ================================================================
+void setMotorSpeeds(int leftPWM, int rightPWM) {
+  if (leftPWM >= 0) {
+    digitalWrite(PIN_IN3, HIGH);
+    digitalWrite(PIN_IN4, LOW);
+  } else {
+    digitalWrite(PIN_IN3, LOW);
+    digitalWrite(PIN_IN4, HIGH);
+  }
+  analogWrite(PIN_ENB, constrain(abs(leftPWM), 0, 255));
+
+  if (rightPWM >= 0) {
+    digitalWrite(PIN_IN1, LOW);
+    digitalWrite(PIN_IN2, HIGH);
+  } else {
+    digitalWrite(PIN_IN1, HIGH);
+    digitalWrite(PIN_IN2, LOW);
+  }
+  analogWrite(PIN_ENA, constrain(abs(rightPWM), 0, 255));
+}
+
+// ================================================================
+//  GENTLE STOP (straight moves)
+// ================================================================
+void gentleStop_ORG() {
+  for (int pwm = CRAWL_SPEED; pwm >= 0; pwm -= 2) {
+    long encDiff = encRight - encLeft;
+    if (abs(encDiff) < DIFF_DEADBAND) encDiff = 0;
+    int correction = constrain(
+      (int)(DIFF_KP * encDiff), -DIFF_STOP_MAX, DIFF_STOP_MAX);
+    int leftPWM  = constrain(pwm + correction, 0, 255);
+    int rightPWM = constrain(pwm - correction, 0, 255);
+    analogWrite(PIN_ENB, leftPWM);
+    analogWrite(PIN_ENA, rightPWM);
+    delay(15);
+  }
+  analogWrite(PIN_ENA, 0);
+  analogWrite(PIN_ENB, 0);
+  delay(80);
+  settleAfterStop();
+}
+
+void gentleStop() {
+  // Ramp from current crawl speed down to zero with trim correction
+  for (int pwm = CRAWL_SPEED; pwm >= 0; pwm -= 1) {
+    long encDiff = encRight - encLeft;
+    if (abs(encDiff) < DIFF_DEADBAND) encDiff = 0;
+    int correction = constrain(
+      (int)(DIFF_KP * encDiff), -DIFF_STOP_MAX, DIFF_STOP_MAX);
+    int leftPWM  = constrain(pwm + correction - STRAIGHT_TRIM, 0, 255);
+    int rightPWM = constrain(pwm - correction + STRAIGHT_TRIM, 0, 255);
+    analogWrite(PIN_ENB, leftPWM);
+    analogWrite(PIN_ENA, rightPWM);
+    delay(20);
+  }
+
+  // Active brake — lock both wheels simultaneously
+  analogWrite(PIN_ENA, 0);
+  analogWrite(PIN_ENB, 0);
+  digitalWrite(PIN_IN1, LOW);
+  digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW);
+  digitalWrite(PIN_IN4, LOW);
+  delay(100);
+
+  analogWrite(PIN_ENA, 0);
+  analogWrite(PIN_ENB, 0);
+  delay(50);
+}
+
+// ================================================================
+//  TURN STOP — gentle ramp to zero
+// ================================================================
+void turnStop_ORG() {
+  for (int pwm = TURN_CRAWL; pwm >= 0; pwm -= 3) {
+    analogWrite(PIN_ENA, max(pwm, 0));
+    analogWrite(PIN_ENB, max(pwm, 0));
+    delay(12);
+  }
+  analogWrite(PIN_ENA, 0);
+  analogWrite(PIN_ENB, 0);
+  delay(100);
+}
+
+void turnStop() {
+  for (int pwm = TURN_CRAWL; pwm >= TURN_CRAWL - 6; pwm -= 3) {
+    analogWrite(PIN_ENA, max(pwm, 0));
+    analogWrite(PIN_ENB, max(pwm, 0));
+    delay(12);
+  }
+
+  // Active brake — lock both wheels simultaneously
+  analogWrite(PIN_ENA, 0);
+  analogWrite(PIN_ENB, 0);
+  digitalWrite(PIN_IN1, LOW);
+  digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW);
+  digitalWrite(PIN_IN4, LOW);
+  delay(100);
+
+  analogWrite(PIN_ENA, 0);
+  analogWrite(PIN_ENB, 0);
+  delay(50);
+}
+
+// ================================================================
+//  DISTANCE / TURN HELPERS
+// ================================================================
+long distToCounts(float cm) {
+  return (long)((cm / (PI * WHEEL_DIAMETER_CM)) * COUNTS_PER_REV_STRAIGHT);
+}
+
+long turnCounts(float deg, float factor) {
+  float arcCm = (deg / 360.0f) * PI * WHEELBASE_CM;
+  return (long)((arcCm / (PI * WHEEL_DIAMETER_CM)) * COUNTS_PER_REV_TURN
+                * factor);
+}
+
+int rampedSpeed(long encAvg, long target) {
+  long remaining = target - encAvg;
+  if (remaining < CRAWL_COUNTS) {
+    float t = sin(((float)remaining / CRAWL_COUNTS) * (PI / 2.0f));
+    return (int)(CRAWL_SPEED + (MAX_SPEED - CRAWL_SPEED) * t);
+  }
+  if (encAvg < RAMP_COUNTS) {
+    float t = sin(((float)encAvg / RAMP_COUNTS) * (PI / 2.0f));
+    return (int)(MIN_SPEED + (MAX_SPEED - MIN_SPEED) * t);
+  }
+  return MAX_SPEED;
+}
+
+// ================================================================
+//  FORWARD
+// ================================================================
+void fwd(float cm) {
+  long target = distToCounts(cm);
+  encRight = 0; encLeft = 0;
+  Serial.print("fwd "); Serial.print(cm); Serial.println(" cm");
+
+  while (((encRight + encLeft) / 2) < target) {
+    long avg      = (encRight + encLeft) / 2;
+    int baseSpeed = rampedSpeed(avg, target);
+    long encDiff  = encRight - encLeft;
+    if (abs(encDiff) < DIFF_DEADBAND) encDiff = 0;
+    int correction = (int)(DIFF_KP * encDiff);
+  //  int leftPWM  = constrain(baseSpeed + correction, MIN_SPEED, MAX_SPEED);
+  //  int rightPWM = constrain(baseSpeed - correction, MIN_SPEED, MAX_SPEED);
+
+    int leftPWM  = constrain(baseSpeed + correction - STRAIGHT_TRIM, MIN_SPEED, MAX_SPEED);
+    int rightPWM = constrain(baseSpeed - correction + STRAIGHT_TRIM, MIN_SPEED, MAX_SPEED);
+
+    setMotorSpeeds(leftPWM, rightPWM);
+  }
+
+  gentleStop();
+  Serial.print("  fwd done. encR="); Serial.print(encRight);
+  Serial.print(" encL="); Serial.println(encLeft);
+  delay(150);
+}
+
+// ================================================================
+//  REVERSE
+// ================================================================
+void rev(float cm) {
+  long target = distToCounts(cm);
+  encRight = 0; encLeft = 0;
+  Serial.print("rev "); Serial.print(cm); Serial.println(" cm");
+
+  while (((encRight + encLeft) / 2) < target) {
+    long avg      = (encRight + encLeft) / 2;
+    int baseSpeed = rampedSpeed(avg, target);
+    long encDiff  = encRight - encLeft;
+    if (abs(encDiff) < DIFF_DEADBAND) encDiff = 0;
+    int correction = (int)(DIFF_KP * encDiff);
+  //  int leftPWM  = constrain(baseSpeed + correction, MIN_SPEED, MAX_SPEED);
+  //  int rightPWM = constrain(baseSpeed - correction, MIN_SPEED, MAX_SPEED);
+
+    int leftPWM  = constrain(baseSpeed + correction - STRAIGHT_TRIM, MIN_SPEED, MAX_SPEED);
+    int rightPWM = constrain(baseSpeed - correction + STRAIGHT_TRIM, MIN_SPEED, MAX_SPEED);
+
+    setMotorSpeeds(-leftPWM, -rightPWM);
+  }
+
+  gentleStop();
+  Serial.print("  rev done. encR="); Serial.print(encRight);
+  Serial.print(" encL="); Serial.println(encLeft);
+  delay(150);
+}
+
+// ================================================================
+//  RIGHT TURN — encoder-based with post-turn gyro measurement
+// ================================================================
+void right(float deg) {
+  long target = turnCounts(deg, TURN_FACTOR_RIGHT);
+  encRight = 0; encLeft = 0;
+  Serial.print("right "); Serial.print(deg);
+  Serial.print(" deg  target="); Serial.print(target);
+  Serial.println(" counts");
+
+  while (((encRight + encLeft) / 2) < target) {
+    long avg       = (encRight + encLeft) / 2;
+    long remaining = target - avg;
+    int speed;
+    if (remaining < TURN_CRAWL_COUNTS) speed = TURN_CRAWL;
+    else if (avg < RAMP_COUNTS) {
+      float t = (float)avg / RAMP_COUNTS;
+      speed = (int)(TURN_MIN_SPEED + (TURN_MAX_SPEED - TURN_MIN_SPEED) * t);
+    } else speed = TURN_MAX_SPEED;
+    setMotorSpeeds(speed, -speed);
+  }
+
+  turnStop();
+
+  // Measure any coast with gyro (motors now off, no vibration)
+  float postAngle = measurePostTurnAngle(300);
+  Serial.print("  right done. encR="); Serial.print(encRight);
+  Serial.print(" encL="); Serial.print(encLeft);
+  Serial.print(" gyro_coast="); Serial.print(postAngle, 1);
+  Serial.println(" deg");
+  delay(150);
+}
+
+// ================================================================
+//  LEFT TURN — encoder-based with post-turn gyro measurement
+// ================================================================
+void left(float deg) {
+  long target = turnCounts(deg, TURN_FACTOR_LEFT);
+  encRight = 0; encLeft = 0;
+  Serial.print("left "); Serial.print(deg);
+  Serial.print(" deg  target="); Serial.print(target);
+  Serial.println(" counts");
+
+  while (((encRight + encLeft) / 2) < target) {
+    long avg       = (encRight + encLeft) / 2;
+    long remaining = target - avg;
+    int speed;
+    if (remaining < TURN_CRAWL_COUNTS) speed = TURN_CRAWL;
+    else if (avg < RAMP_COUNTS) {
+      float t = (float)avg / RAMP_COUNTS;
+      speed = (int)(TURN_MIN_SPEED + (TURN_MAX_SPEED - TURN_MIN_SPEED) * t);
+    } else speed = TURN_MAX_SPEED;
+    setMotorSpeeds(-speed, speed);
+  }
+
+  turnStop();
+
+  float postAngle = measurePostTurnAngle(300);
+  Serial.print("  left done. encR="); Serial.print(encRight);
+  Serial.print(" encL="); Serial.print(encLeft);
+  Serial.print(" gyro_coast="); Serial.print(postAngle, 1);
+  Serial.println(" deg");
+  delay(150);
+}
