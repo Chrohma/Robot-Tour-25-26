@@ -1,0 +1,341 @@
+// ================================================================
+//  ROBOT TOUR — Arduino Mega 2560 + DRI0041 + FIT0186 + BNO055
+//  v8.4 — Fixed decel drift + distance overshoot
+//         LEFT:  Motor B (10/11/12), fwd=IN3 LOW IN4 HIGH, enc pin 2
+//         RIGHT: Motor A (9/7/8),   fwd=IN1 LOW IN2 HIGH, enc pin 3
+//         BNO055: SDA=20, SCL=21
+// ================================================================
+
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+float missionHeading = 0.0f;
+
+// === Physical Constants ===
+#define COUNTS_PER_REV     660.0f
+#define WHEEL_DIAMETER_CM  12.4f
+
+// === Straight-line Speed ===
+#define MAX_SPEED      40
+#define MIN_SPEED      28
+#define CRAWL_SPEED    18
+#define RAMP_COUNTS    350
+#define CRAWL_COUNTS   500
+
+// === Heading PID ===
+#define HEADING_KP     0.8f
+
+// === Turn Speed ===
+#define TURN_MAX_SPEED   30
+#define TURN_MIN_SPEED   22
+#define TURN_CRAWL_SPEED 18
+#define TURN_FAST_ZONE   25.0f
+#define TURN_SLOW_ZONE   15.0f
+#define TURN_TOLERANCE   1.0f
+#define TURN_SETTLE_MS   200
+
+// === Pins ===
+#define MOTOR_A_ENA  9
+#define MOTOR_A_IN1  7
+#define MOTOR_A_IN2  8
+
+#define MOTOR_B_ENB  10
+#define MOTOR_B_IN3  11
+#define MOTOR_B_IN4  12
+
+#define ENC_LEFT_PIN   2
+#define ENC_RIGHT_PIN  3
+
+volatile long encLeft  = 0;
+volatile long encRight = 0;
+
+void isrLeft()  { encLeft++;  }
+void isrRight() { encRight++; }
+
+// ================================================================
+//  BNO055 HEADING
+// ================================================================
+
+float getHeading() {
+  sensors_event_t event;
+  bno.getEvent(&event);
+  return event.orientation.x;
+}
+
+float angleDiff(float target, float current) {
+  float diff = target - current;
+  while (diff > 180.0f)  diff -= 360.0f;
+  while (diff < -180.0f) diff += 360.0f;
+  return diff;
+}
+
+float normalizeAngle(float angle) {
+  while (angle < 0.0f)    angle += 360.0f;
+  while (angle >= 360.0f) angle -= 360.0f;
+  return angle;
+}
+
+// ================================================================
+//  MOTOR CONTROL
+// ================================================================
+
+void setMotors(int leftSpeed, int rightSpeed) {
+  if (leftSpeed >= 0) {
+    digitalWrite(MOTOR_B_IN3, LOW);
+    digitalWrite(MOTOR_B_IN4, HIGH);
+  } else {
+    digitalWrite(MOTOR_B_IN3, HIGH);
+    digitalWrite(MOTOR_B_IN4, LOW);
+    leftSpeed = -leftSpeed;
+  }
+  analogWrite(MOTOR_B_ENB, constrain(leftSpeed, 0, 255));
+
+  if (rightSpeed >= 0) {
+    digitalWrite(MOTOR_A_IN1, LOW);
+    digitalWrite(MOTOR_A_IN2, HIGH);
+  } else {
+    digitalWrite(MOTOR_A_IN1, HIGH);
+    digitalWrite(MOTOR_A_IN2, LOW);
+    rightSpeed = -rightSpeed;
+  }
+  analogWrite(MOTOR_A_ENA, constrain(rightSpeed, 0, 255));
+}
+
+void motorsBrake() {
+  analogWrite(MOTOR_A_ENA, 0);
+  analogWrite(MOTOR_B_ENB, 0);
+  digitalWrite(MOTOR_A_IN1, LOW);
+  digitalWrite(MOTOR_A_IN2, LOW);
+  digitalWrite(MOTOR_B_IN3, LOW);
+  digitalWrite(MOTOR_B_IN4, LOW);
+}
+
+// ================================================================
+//  SMOOTH STOP — shorter coast, full heading correction throughout
+// ================================================================
+
+void smoothStop() {
+  int steps = 25;
+  for (int i = 1; i <= steps; i++) {
+    float factor = cos(((float)i / (float)steps) * (PI / 2.0f));
+    if (factor < 0.0f) factor = 0.0f;
+
+    int pwm = (int)(CRAWL_SPEED * factor);
+
+    // Full heading correction — does NOT fade with speed
+    float headingError = angleDiff(missionHeading, getHeading());
+    int correction = (int)(HEADING_KP * headingError);
+
+    setMotors(pwm + correction, pwm - correction);
+    delay(15);
+  }
+
+  motorsBrake();
+  delay(150);
+}
+
+// ================================================================
+//  HELPERS
+// ================================================================
+
+void d(float seconds) {
+  delay((unsigned long)(seconds * 1000.0f));
+}
+
+int rampedSpeed(long encAvg, long target) {
+  long remaining = target - encAvg;
+
+  if (remaining < CRAWL_COUNTS) {
+    float t = sin(((float)remaining / CRAWL_COUNTS) * (PI / 2.0f));
+    return (int)(CRAWL_SPEED + (MAX_SPEED - CRAWL_SPEED) * t);
+  }
+
+  if (encAvg < RAMP_COUNTS) {
+    float t = sin(((float)encAvg / RAMP_COUNTS) * (PI / 2.0f));
+    return (int)(MIN_SPEED + (MAX_SPEED - MIN_SPEED) * t);
+  }
+
+  return MAX_SPEED;
+}
+
+long distToCounts(float cm) {
+  return (long)((cm / (PI * WHEEL_DIAMETER_CM)) * COUNTS_PER_REV);
+}
+
+// ================================================================
+//  FWD
+// ================================================================
+
+void fwd(float cm) {
+  long target = distToCounts(cm);
+  encLeft = 0;
+  encRight = 0;
+
+  while (((encLeft + encRight) / 2) < target) {
+    long avg = (encLeft + encRight) / 2;
+    int baseSpeed = rampedSpeed(avg, target);
+
+    float headingError = angleDiff(missionHeading, getHeading());
+    int correction = (int)(HEADING_KP * headingError);
+
+    int leftPWM  = constrain(baseSpeed + correction, MIN_SPEED, MAX_SPEED);
+    int rightPWM = constrain(baseSpeed - correction, MIN_SPEED, MAX_SPEED);
+
+    setMotors(leftPWM, rightPWM);
+    delay(10);
+  }
+
+  smoothStop();
+  delay(200);
+}
+
+// ================================================================
+//  REV
+// ================================================================
+
+void rev(float cm) {
+  long target = distToCounts(cm);
+  encLeft = 0;
+  encRight = 0;
+
+  while (((encLeft + encRight) / 2) < target) {
+    long avg = (encLeft + encRight) / 2;
+    int baseSpeed = rampedSpeed(avg, target);
+
+    float headingError = angleDiff(missionHeading, getHeading());
+    int correction = (int)(HEADING_KP * headingError);
+
+    int leftPWM  = constrain(baseSpeed - correction, MIN_SPEED, MAX_SPEED);
+    int rightPWM = constrain(baseSpeed + correction, MIN_SPEED, MAX_SPEED);
+
+    setMotors(-leftPWM, -rightPWM);
+    delay(10);
+  }
+
+  smoothStop();
+  delay(200);
+}
+
+// ================================================================
+//  TURNS
+// ================================================================
+
+void turnToHeading(float targetHeading) {
+  targetHeading = normalizeAngle(targetHeading);
+  unsigned long timeout = millis() + 5000;
+
+  while (millis() < timeout) {
+    float error = angleDiff(targetHeading, getHeading());
+    if (abs(error) < TURN_TOLERANCE) break;
+
+    float absErr = abs(error);
+    int spd;
+
+    if (absErr > TURN_FAST_ZONE)
+      spd = TURN_MAX_SPEED;
+    else if (absErr > TURN_SLOW_ZONE) {
+      float frac = (absErr - TURN_SLOW_ZONE) / (TURN_FAST_ZONE - TURN_SLOW_ZONE);
+      spd = (int)(TURN_MIN_SPEED + (TURN_MAX_SPEED - TURN_MIN_SPEED) * frac);
+    } else {
+      float frac = absErr / TURN_SLOW_ZONE;
+      spd = (int)(TURN_CRAWL_SPEED + (TURN_MIN_SPEED - TURN_CRAWL_SPEED) * frac);
+    }
+
+    if (error > 0)
+      setMotors(spd, -spd);
+    else
+      setMotors(-spd, spd);
+  }
+
+  motorsBrake();
+  delay(TURN_SETTLE_MS);
+
+  // Overshoot correction
+  float finalError = angleDiff(targetHeading, getHeading());
+  if (abs(finalError) > TURN_TOLERANCE) {
+    unsigned long fixTimeout = millis() + 2000;
+    while (millis() < fixTimeout) {
+      float err = angleDiff(targetHeading, getHeading());
+      if (abs(err) < TURN_TOLERANCE) break;
+
+      int spd = TURN_CRAWL_SPEED;
+      if (err > 0)
+        setMotors(spd, -spd);
+      else
+        setMotors(-spd, spd);
+    }
+    motorsBrake();
+    delay(200);
+  }
+}
+
+void right(float deg) {
+  missionHeading = normalizeAngle(missionHeading + deg);
+  turnToHeading(missionHeading);
+}
+
+void left(float deg) {
+  missionHeading = normalizeAngle(missionHeading - deg);
+  turnToHeading(missionHeading);
+}
+
+// ================================================================
+//  MISSION
+// ================================================================
+
+void runMission() {
+  for(int i = 0;i<4;i++){
+  fwd(50);
+  d(1);
+  right(90);
+  d(1);
+  }
+}
+
+// ================================================================
+//  SETUP
+// ================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("Robot Tour v8.4 — Mega 2560");
+
+  pinMode(MOTOR_A_IN1, OUTPUT);
+  pinMode(MOTOR_A_IN2, OUTPUT);
+  pinMode(MOTOR_B_IN3, OUTPUT);
+  pinMode(MOTOR_B_IN4, OUTPUT);
+  pinMode(MOTOR_A_ENA, OUTPUT);
+  pinMode(MOTOR_B_ENB, OUTPUT);
+
+  pinMode(ENC_LEFT_PIN, INPUT_PULLUP);
+  pinMode(ENC_RIGHT_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_LEFT_PIN), isrLeft, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_RIGHT_PIN), isrRight, RISING);
+
+  motorsBrake();
+
+  Wire.begin();
+
+  if (!bno.begin()) {
+    Serial.println("BNO055 FAILED!");
+    while (1) delay(100);
+  }
+
+  bno.setExtCrystalUse(true);
+  delay(1000);
+
+  missionHeading = getHeading();
+  Serial.print("Start heading: ");
+  Serial.println(missionHeading);
+
+  Serial.println("Mission in 5 sec...");
+  delay(1000);
+  runMission();
+  motorsBrake();
+  Serial.println("Done.");
+}
+
+void loop() {}
