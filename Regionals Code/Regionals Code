@@ -1,0 +1,445 @@
+// ================================================================
+//  ROBOT TOUR — Arduino Mega 2560 + DRI0041 + FIT0186 + BNO055
+//  v9.6 — Encoder diff straight + BNO055 turns + pulse heading check
+//         LEFT:  Motor B (10/11/12), fwd=IN3 LOW IN4 HIGH, enc pin 2
+//         RIGHT: Motor A (9/7/8),   fwd=IN1 LOW IN2 HIGH, enc pin 3
+//         BNO055: SDA=20, SCL=21
+// ================================================================
+
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+float missionHeading = 0.0f;
+
+// === Physical Constants ===
+#define COUNTS_PER_REV     565.0f
+#define WHEEL_DIAMETER_CM  12.4f
+
+// === Straight-line Speed ===
+#define MAX_SPEED      32
+#define MIN_SPEED      15
+#define CRAWL_SPEED    18
+#define RAMP_COUNTS    300
+#define CRAWL_COUNTS   350
+
+// === Encoder Differential (v6.2 proven) ===
+#define DIFF_KP        1.5f
+#define DIFF_DEADBAND  2
+#define DIFF_STOP_MAX  5
+
+// === Turn Speed (all above stall) ===
+#define TURN_MAX_SPEED   25
+#define TURN_MIN_SPEED   22
+#define TURN_CRAWL_SPEED 20
+#define TURN_FAST_ZONE   25.0f
+#define TURN_SLOW_ZONE   15.0f
+#define TURN_TOLERANCE   1.0f
+
+// === Pins ===
+#define MOTOR_A_ENA  9
+#define MOTOR_A_IN1  7
+#define MOTOR_A_IN2  8
+
+#define MOTOR_B_ENB  10
+#define MOTOR_B_IN3  11
+#define MOTOR_B_IN4  12
+
+#define ENC_LEFT_PIN   2
+#define ENC_RIGHT_PIN  3
+
+volatile long encLeft  = 0;
+volatile long encRight = 0;
+
+void isrLeft()  { encLeft++;  }
+void isrRight() { encRight++; }
+
+// ================================================================
+//  BNO055 HEADING
+// ================================================================
+
+float getHeading() {
+  sensors_event_t event;
+  bno.getEvent(&event);
+  return event.orientation.x;
+}
+
+float angleDiff(float target, float current) {
+  float diff = target - current;
+  while (diff > 180.0f)  diff -= 360.0f;
+  while (diff < -180.0f) diff += 360.0f;
+  return diff;
+}
+
+float normalizeAngle(float angle) {
+  while (angle < 0.0f)    angle += 360.0f;
+  while (angle >= 360.0f) angle -= 360.0f;
+  return angle;
+}
+
+// ================================================================
+//  BNO055 CALIBRATION WAIT
+// ================================================================
+
+void waitForCalibration() {
+  Serial.println("Calibrating BNO055 — keep robot STILL...");
+
+  unsigned long start = millis();
+  while (millis() - start < 5000) {
+    uint8_t sys, gyr, acc, mag;
+    bno.getCalibration(&sys, &gyr, &acc, &mag);
+
+    Serial.print("  sys:"); Serial.print(sys);
+    Serial.print(" gyr:"); Serial.print(gyr);
+    Serial.print(" acc:"); Serial.print(acc);
+    Serial.print(" mag:"); Serial.println(mag);
+
+    if (gyr >= 3) {
+      Serial.println("Gyro calibrated!");
+      break;
+    }
+    delay(500);
+  }
+
+  for (int i = 0; i < 20; i++) {
+    getHeading();
+    delay(50);
+  }
+
+  Serial.print("Heading settled at: ");
+  Serial.println(getHeading());
+}
+
+// ================================================================
+//  MOTOR CONTROL (verified by diagnostic)
+// ================================================================
+
+void setMotors(int leftSpeed, int rightSpeed) {
+  if (leftSpeed >= 0) {
+    digitalWrite(MOTOR_B_IN3, LOW);
+    digitalWrite(MOTOR_B_IN4, HIGH);
+  } else {
+    digitalWrite(MOTOR_B_IN3, HIGH);
+    digitalWrite(MOTOR_B_IN4, LOW);
+    leftSpeed = -leftSpeed;
+  }
+  analogWrite(MOTOR_B_ENB, constrain(leftSpeed, 0, 255));
+
+  if (rightSpeed >= 0) {
+    digitalWrite(MOTOR_A_IN1, LOW);
+    digitalWrite(MOTOR_A_IN2, HIGH);
+  } else {
+    digitalWrite(MOTOR_A_IN1, HIGH);
+    digitalWrite(MOTOR_A_IN2, LOW);
+    rightSpeed = -rightSpeed;
+  }
+  analogWrite(MOTOR_A_ENA, constrain(rightSpeed, 0, 255));
+}
+
+void motorsBrake() {
+  analogWrite(MOTOR_A_ENA, 0);
+  analogWrite(MOTOR_B_ENB, 0);
+  digitalWrite(MOTOR_A_IN1, LOW);
+  digitalWrite(MOTOR_A_IN2, LOW);
+  digitalWrite(MOTOR_B_IN3, LOW);
+  digitalWrite(MOTOR_B_IN4, LOW);
+}
+
+// ================================================================
+//  GENTLE STOP (v6.2 proven — encoder correction through stop)
+// ================================================================
+
+void gentleStop() {
+  for (int pwm = CRAWL_SPEED; pwm >= 0; pwm -= 1) {
+    long encDiff = encLeft - encRight;
+    if (abs(encDiff) < DIFF_DEADBAND) encDiff = 0;
+    int correction = constrain(
+      (int)(DIFF_KP * encDiff), -DIFF_STOP_MAX, DIFF_STOP_MAX);
+
+    int leftPWM  = constrain(pwm - correction, 0, 255);
+    int rightPWM = constrain(pwm + correction, 0, 255);
+
+    analogWrite(MOTOR_B_ENB, leftPWM);
+    analogWrite(MOTOR_A_ENA, rightPWM);
+    delay(20);
+  }
+
+  motorsBrake();
+  delay(100);
+}
+
+// ================================================================
+//  HEADING CHECK — pulse-brake-read
+//
+//  Why this works:
+//    - Each pulse is short (20ms at PWM 22) = tiny rotation (~0.5°)
+//    - Full brake + 150ms wait = robot completely still before reading
+//    - Reading at standstill = accurate, no momentum contamination
+//    - Can't overshoot because it stops fully between every pulse
+//    - Worst case: takes 6 pulses for 3° error = ~1 second
+// ================================================================
+
+void headingCheck() {
+  motorsBrake();
+  delay(500);
+
+  // Let BNO055 settle with fresh reads
+  for (int i = 0; i < 10; i++) {
+    getHeading();
+    delay(50);
+  }
+
+  unsigned long timeout = millis() + 3000;
+
+  while (millis() < timeout) {
+    float error = angleDiff(missionHeading, getHeading());
+
+    // Within 1.5° — good enough, exit
+    if (abs(error) < 1.5f) break;
+
+    // Short pulse in correct direction
+    if (error > 0)
+      setMotors(22, -22);
+    else
+      setMotors(-22, 22);
+
+    delay(20);
+
+    // Full stop
+    motorsBrake();
+
+    // Wait for robot to be completely still before reading again
+    delay(150);
+  }
+
+  motorsBrake();
+  delay(300);
+}
+
+// ================================================================
+//  HELPERS
+// ================================================================
+
+void d(float seconds) {
+  delay((unsigned long)(seconds * 1000.0f));
+}
+
+int rampedSpeed(long encAvg, long target) {
+  long remaining = target - encAvg;
+
+  if (remaining < CRAWL_COUNTS) {
+    float t = sin(((float)remaining / CRAWL_COUNTS) * (PI / 2.0f));
+    return (int)(CRAWL_SPEED + (MAX_SPEED - CRAWL_SPEED) * t);
+  }
+
+  if (encAvg < RAMP_COUNTS) {
+    float t = sin(((float)encAvg / RAMP_COUNTS) * (PI / 2.0f));
+    return (int)(MIN_SPEED + (MAX_SPEED - MIN_SPEED) * t);
+  }
+
+  return MAX_SPEED;
+}
+
+long distToCounts(float cm) {
+  return (long)((cm / (PI * WHEEL_DIAMETER_CM)) * COUNTS_PER_REV);
+}
+
+// ================================================================
+//  FWD — Encoder differential (no delay, max response speed)
+//
+//  encLeft > encRight → left faster → slow left, speed right
+//  Both motors always ≥ MIN_SPEED — no pivoting, always driving
+// ================================================================
+
+void fwd(float cm) {
+  long target = distToCounts(cm);
+  encLeft = 0;
+  encRight = 0;
+
+  Serial.print("fwd "); Serial.print(cm); Serial.println(" cm");
+
+  while (((encLeft + encRight) / 2) < target) {
+    long avg = (encLeft + encRight) / 2;
+    int baseSpeed = rampedSpeed(avg, target);
+
+    long encDiff = encLeft - encRight;
+    if (abs(encDiff) < DIFF_DEADBAND) encDiff = 0;
+    int correction = (int)(DIFF_KP * encDiff);
+
+    int leftPWM  = constrain(baseSpeed - correction, MIN_SPEED, MAX_SPEED);
+    int rightPWM = constrain(baseSpeed + correction, MIN_SPEED, MAX_SPEED);
+
+    setMotors(leftPWM, rightPWM);
+  }
+
+  gentleStop();
+
+  Serial.print("  done. encL="); Serial.print(encLeft);
+  Serial.print(" encR="); Serial.println(encRight);
+
+  headingCheck();
+}
+
+// ================================================================
+//  REV — Encoder differential, motors reversed
+// ================================================================
+
+void rev(float cm) {
+  long target = distToCounts(cm);
+  encLeft = 0;
+  encRight = 0;
+
+  Serial.print("rev "); Serial.print(cm); Serial.println(" cm");
+
+  while (((encLeft + encRight) / 2) < target) {
+    long avg = (encLeft + encRight) / 2;
+    int baseSpeed = rampedSpeed(avg, target);
+
+    long encDiff = encLeft - encRight;
+    if (abs(encDiff) < DIFF_DEADBAND) encDiff = 0;
+    int correction = (int)(DIFF_KP * encDiff);
+
+    int leftPWM  = constrain(baseSpeed - correction, MIN_SPEED, MAX_SPEED);
+    int rightPWM = constrain(baseSpeed + correction, MIN_SPEED, MAX_SPEED);
+
+    setMotors(-leftPWM, -rightPWM);
+  }
+
+  gentleStop();
+
+  Serial.print("  done. encL="); Serial.print(encLeft);
+  Serial.print(" encR="); Serial.println(encRight);
+
+  headingCheck();
+}
+
+// ================================================================
+//  TURNS — Pure BNO055 real-time, all speeds ≥ 20 (above stall)
+// ================================================================
+
+void turnToHeading(float targetHeading) {
+  targetHeading = normalizeAngle(targetHeading);
+  unsigned long timeout = millis() + 5000;
+
+  while (millis() < timeout) {
+    float error = angleDiff(targetHeading, getHeading());
+    if (abs(error) < TURN_TOLERANCE) break;
+
+    float absErr = abs(error);
+    int spd;
+
+    if (absErr > TURN_FAST_ZONE)
+      spd = TURN_MAX_SPEED;
+    else if (absErr > TURN_SLOW_ZONE) {
+      float frac = (absErr - TURN_SLOW_ZONE) / (TURN_FAST_ZONE - TURN_SLOW_ZONE);
+      spd = (int)(TURN_MIN_SPEED + (TURN_MAX_SPEED - TURN_MIN_SPEED) * frac);
+    } else {
+      float frac = absErr / TURN_SLOW_ZONE;
+      spd = (int)(TURN_CRAWL_SPEED + (TURN_MIN_SPEED - TURN_CRAWL_SPEED) * frac);
+    }
+
+    if (error > 0)
+      setMotors(spd, -spd);
+    else
+      setMotors(-spd, spd);
+  }
+
+  motorsBrake();
+  delay(200);
+
+  // Overshoot correction — also above stall
+  float finalError = angleDiff(targetHeading, getHeading());
+  if (abs(finalError) > TURN_TOLERANCE) {
+    unsigned long fixTimeout = millis() + 2000;
+    while (millis() < fixTimeout) {
+      float err = angleDiff(targetHeading, getHeading());
+      if (abs(err) < TURN_TOLERANCE) break;
+
+      if (err > 0)
+        setMotors(TURN_CRAWL_SPEED, -TURN_CRAWL_SPEED);
+      else
+        setMotors(-TURN_CRAWL_SPEED, TURN_CRAWL_SPEED);
+    }
+    motorsBrake();
+  }
+
+  headingCheck();
+}
+
+void right(float deg) {
+  missionHeading = normalizeAngle(missionHeading + deg);
+  turnToHeading(missionHeading);
+}
+
+void left(float deg) {
+  missionHeading = normalizeAngle(missionHeading - deg);
+  turnToHeading(missionHeading);
+}
+
+// ================================================================
+//  MISSION
+// ================================================================
+
+void runMission() {
+  fwd(50);
+  fwd(50);
+  fwd(50);
+  fwd(50);
+  right(90);
+  fwd(50);
+  rev(50);
+  left(90);
+  rev(50);
+  rev(50);
+  rev(50);
+  rev(50);
+}
+
+// ================================================================
+//  SETUP
+// ================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("Robot Tour v9.6 — Mega 2560");
+
+  pinMode(MOTOR_A_IN1, OUTPUT);
+  pinMode(MOTOR_A_IN2, OUTPUT);
+  pinMode(MOTOR_B_IN3, OUTPUT);
+  pinMode(MOTOR_B_IN4, OUTPUT);
+  pinMode(MOTOR_A_ENA, OUTPUT);
+  pinMode(MOTOR_B_ENB, OUTPUT);
+
+  pinMode(ENC_LEFT_PIN, INPUT_PULLUP);
+  pinMode(ENC_RIGHT_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_LEFT_PIN), isrLeft, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_RIGHT_PIN), isrRight, RISING);
+
+  motorsBrake();
+
+  Wire.begin();
+
+  if (!bno.begin()) {
+    Serial.println("BNO055 FAILED!");
+    while (1) delay(100);
+  }
+
+  bno.setExtCrystalUse(true);
+  delay(1000);
+
+  waitForCalibration();
+
+  missionHeading = getHeading();
+  Serial.print("Start heading: ");
+  Serial.println(missionHeading);
+
+  Serial.println("Mission in 5 sec...");
+  delay(5000);
+  runMission();
+  motorsBrake();
+  Serial.println("Done.");
+}
+
+void loop() {}
