@@ -1,0 +1,467 @@
+// ================================================================
+//  ROBOT TOUR — Arduino Mega 2560 + DRI0041 + FIT0186 + BNO055
+//  v12.0 — Clean build: encoder drive + IMU steering + IMU turns
+//
+//  VERIFIED HARDWARE (tested 4/7/2026):
+//    Left fwd:  IN1=HIGH, IN2=LOW   → encLeft POSITIVE
+//    Right fwd: IN3=LOW,  IN4=HIGH  → encRight POSITIVE
+//    Left rev:  IN1=LOW,  IN2=HIGH  → encLeft NEGATIVE
+//    Right rev: IN3=HIGH, IN4=LOW   → encRight NEGATIVE
+//
+//  SIGN CONVENTIONS (traced and verified):
+//    angleDiff > 0 → target is CW from current → need to turn RIGHT
+//    Turn RIGHT: setMotors(+spd, -spd) → left fwd, right back → CW
+//    Turn LEFT:  setMotors(-spd, +spd) → right fwd, left back → CCW
+//    Steering +  → turn RIGHT → left faster, right slower
+//    Steering -  → turn LEFT  → right faster, left slower
+// ================================================================
+
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+float missionHeading = 0.0f;
+
+// === Pins ===
+#define MOTOR_A_ENA  9
+#define MOTOR_A_IN1  7
+#define MOTOR_A_IN2  8
+#define MOTOR_B_ENB  10
+#define MOTOR_B_IN3  11
+#define MOTOR_B_IN4  12
+#define ENC_LEFT_PIN   3
+#define ENC_RIGHT_PIN  2
+
+// === Physical Constants ===
+#define COUNTS_PER_REV     1300.0f
+#define WHEEL_DIAMETER_CM  9.8425f
+#define TRACK_WIDTH_CM     21.55f
+#define COUNTS_PER_DEGREE  7.91f
+
+// === Drive Speed ===
+#define DRIVE_SPEED    35
+#define MIN_SPEED      20
+#define RAMP_UP_COUNTS 200
+#define RAMP_DN_COUNTS 400
+
+// === Steering PID ===
+#define MATCH_KP       1.5f
+#define HEADING_KP     2.0f
+
+// === Turn ===
+#define TURN_SPEED     25
+#define TURN_MIN       20
+#define TURN_DECEL     200
+#define TURN_RAMP      80
+#define TURN_TOLERANCE 1.0f
+
+// === Heading Fix ===
+#define FIX_KP         5.0f
+#define FIX_MAX_SPEED  25
+#define FIX_MIN_SPEED  18
+
+// ================================================================
+//  ENCODERS — verified directions from hardware test
+// ================================================================
+
+volatile long encLeft  = 0;
+volatile long encRight = 0;
+
+// Forward = POSITIVE (verified: encLeft=+3792 during fwd)
+void isrLeft() {
+  int a = digitalRead(ENC_LEFT_PIN);
+  int b = digitalRead(18);
+  if (a == b) encLeft--;
+  else        encLeft++;
+}
+
+// Forward = POSITIVE (flipped to fix: was -3341 during fwd)
+void isrRight() {
+  int a = digitalRead(ENC_RIGHT_PIN);
+  int b = digitalRead(19);
+  if (a == b) encRight++;
+  else        encRight--;
+}
+
+// ================================================================
+//  MOTOR CONTROL — verified from hardware test
+// ================================================================
+
+void setMotors(int leftSpeed, int rightSpeed) {
+  if (leftSpeed >= 0) {
+    digitalWrite(MOTOR_A_IN1, HIGH);
+    digitalWrite(MOTOR_A_IN2, LOW);
+  } else {
+    digitalWrite(MOTOR_A_IN1, LOW);
+    digitalWrite(MOTOR_A_IN2, HIGH);
+    leftSpeed = -leftSpeed;
+  }
+  analogWrite(MOTOR_A_ENA, constrain(leftSpeed, 0, 255));
+
+  if (rightSpeed >= 0) {
+    digitalWrite(MOTOR_B_IN3, LOW);
+    digitalWrite(MOTOR_B_IN4, HIGH);
+  } else {
+    digitalWrite(MOTOR_B_IN3, HIGH);
+    digitalWrite(MOTOR_B_IN4, LOW);
+    rightSpeed = -rightSpeed;
+  }
+  analogWrite(MOTOR_B_ENB, constrain(rightSpeed, 0, 255));
+}
+
+void stopMotors() {
+  analogWrite(MOTOR_A_ENA, 0);
+  analogWrite(MOTOR_B_ENB, 0);
+  digitalWrite(MOTOR_A_IN1, LOW);
+  digitalWrite(MOTOR_A_IN2, LOW);
+  digitalWrite(MOTOR_B_IN3, LOW);
+  digitalWrite(MOTOR_B_IN4, LOW);
+}
+
+// ================================================================
+//  BNO055
+// ================================================================
+
+float getHeading() {
+  sensors_event_t event;
+  bno.getEvent(&event);
+  return event.orientation.x;
+}
+
+// direction: 0=auto, +1=force CW, -1=force CCW
+float angleDiff(float target, float current, int direction = 0) {
+  float diff = target - current;
+  while (diff >  180.0f) diff -= 360.0f;
+  while (diff < -180.0f) diff += 360.0f;
+  if (direction != 0 && abs(diff) > 179.5f) {
+    diff = (direction > 0) ? abs(diff) : -abs(diff);
+  }
+  return diff;
+}
+
+float normalizeAngle(float angle) {
+  while (angle <    0.0f) angle += 360.0f;
+  while (angle >= 360.0f) angle -= 360.0f;
+  return angle;
+}
+
+void waitForCalibration() {
+  Serial.println("Calibrating BNO055 — keep robot STILL...");
+  unsigned long start = millis();
+  while (millis() - start < 5000) {
+    uint8_t sys, gyr, acc, mag;
+    bno.getCalibration(&sys, &gyr, &acc, &mag);
+    Serial.print("  sys:"); Serial.print(sys);
+    Serial.print(" gyr:"); Serial.print(gyr);
+    Serial.print(" acc:"); Serial.print(acc);
+    Serial.print(" mag:"); Serial.println(mag);
+    if (gyr >= 3) { Serial.println("Gyro calibrated!"); break; }
+    delay(500);
+  }
+  for (int i = 0; i < 20; i++) { getHeading(); delay(50); }
+  Serial.print("Heading settled at: "); Serial.println(getHeading());
+}
+
+// ================================================================
+//  HELPERS
+// ================================================================
+
+void d(float seconds) {
+  delay((unsigned long)(seconds * 1000.0f));
+}
+
+long cmToCounts(float cm) {
+  return (long)((cm / (3.14159f * WHEEL_DIAMETER_CM)) * COUNTS_PER_REV);
+}
+
+void resetEncoders() {
+  noInterrupts();
+  encLeft  = 0;
+  encRight = 0;
+  interrupts();
+}
+
+// ================================================================
+//  SPEED PROFILE — ramp up at start, ramp down at end
+//  Never goes below MIN_SPEED so motors never stall
+// ================================================================
+
+int driveSpeed(long avg, long target) {
+  int speed = DRIVE_SPEED;
+
+  // Ramp down near target
+  long remaining = target - avg;
+  if (remaining < RAMP_DN_COUNTS) {
+    speed = MIN_SPEED + (int)((float)(DRIVE_SPEED - MIN_SPEED) * remaining / RAMP_DN_COUNTS);
+  }
+
+  // Ramp up from start
+  if (avg < RAMP_UP_COUNTS) {
+    int rampSpeed = MIN_SPEED + (int)((float)(DRIVE_SPEED - MIN_SPEED) * avg / RAMP_UP_COUNTS);
+    speed = min(speed, rampSpeed);
+  }
+
+  return max(speed, MIN_SPEED);
+}
+
+// ================================================================
+//  SMOOTH STOP — ramp from MIN_SPEED to 0
+// ================================================================
+
+void smoothStop(int dir) {
+  // dir: 1 = was driving forward, -1 = was driving reverse
+  for (int s = MIN_SPEED; s > 0; s -= 5) {
+    setMotors(dir * s, dir * s);
+    delay(15);
+  }
+  stopMotors();
+  delay(50);
+}
+
+// ================================================================
+//  HEADING CHECK — continuous P, quick and powerful
+// ================================================================
+
+void headingCheck() {
+  stopMotors();
+  delay(50);
+
+  // Flush IMU
+  for (int i = 0; i < 3; i++) { getHeading(); delay(20); }
+
+  unsigned long timeout = millis() + 2000;
+  while (millis() < timeout) {
+    float error = angleDiff(missionHeading, getHeading());
+    if (abs(error) < 1.0f) break;
+
+    // P control with min speed floor so motors don't stall
+    int spd = constrain((int)(FIX_KP * error), -FIX_MAX_SPEED, FIX_MAX_SPEED);
+    if (spd > 0 && spd < FIX_MIN_SPEED) spd = FIX_MIN_SPEED;
+    if (spd < 0 && spd > -FIX_MIN_SPEED) spd = -FIX_MIN_SPEED;
+
+    // Positive error = need CW = setMotors(+, -)
+    setMotors(spd, -spd);
+    delay(10);
+  }
+
+  stopMotors();
+  delay(50);
+}
+
+// ================================================================
+//  FWD — encoder distance + encoder match + heading correction
+//
+//  Steering sign convention (verified):
+//    steering > 0 → turn RIGHT → left faster, right slower
+//    steering < 0 → turn LEFT  → right faster, left slower
+// ================================================================
+
+void fwd(float cm) {
+  long target = cmToCounts(cm);
+  resetEncoders();
+
+  Serial.print("fwd "); Serial.print(cm); Serial.println(" cm");
+
+  while (((encLeft + encRight) / 2) < target) {
+    long avg = (encLeft + encRight) / 2;
+    int speed = driveSpeed(avg, target);
+
+    // Encoder matching: left ahead → diff > 0 → steer left → negative
+    float enc_steering = -MATCH_KP * (encLeft - encRight);
+
+    // Heading: drift right → error < 0 → steer left → negative
+    float heading_steering = HEADING_KP * angleDiff(missionHeading, getHeading());
+
+    int steering = constrain((int)(enc_steering + heading_steering), -15, 15);
+
+    // steering > 0 → left faster (turn right)
+    // steering < 0 → right faster (turn left)
+    int leftPWM  = constrain(speed + steering, MIN_SPEED, DRIVE_SPEED);
+    int rightPWM = constrain(speed - steering, MIN_SPEED, DRIVE_SPEED);
+
+    setMotors(leftPWM, rightPWM);
+  }
+
+  smoothStop(1);
+
+  Serial.print("  encL="); Serial.print(encLeft);
+  Serial.print(" encR="); Serial.println(encRight);
+
+  headingCheck();
+}
+
+// ================================================================
+//  REV — same as fwd but negated, steering sign flipped for reverse
+//
+//  In reverse, left faster backward → turns LEFT (opposite of fwd)
+//  So steering sign flips: apply negative steering to get same effect
+// ================================================================
+
+void rev(float cm) {
+  long target = cmToCounts(cm);
+  resetEncoders();
+
+  Serial.print("rev "); Serial.print(cm); Serial.println(" cm");
+
+  while (abs((encLeft + encRight) / 2) < target) {
+    long avg = abs((encLeft + encRight) / 2);
+    int speed = driveSpeed(avg, target);
+
+    // Encoder matching using abs values (both encoders negative in rev)
+    float enc_steering = -MATCH_KP * (abs(encLeft) - abs(encRight));
+
+    // Heading correction — same calculation
+    float heading_steering = HEADING_KP * angleDiff(missionHeading, getHeading());
+
+    int steering = constrain((int)(enc_steering + heading_steering), -15, 15);
+
+    // FLIP steering for reverse (left faster backward = turn LEFT, not right)
+    int leftPWM  = constrain(speed + steering, MIN_SPEED, DRIVE_SPEED);
+    int rightPWM = constrain(speed - steering, MIN_SPEED, DRIVE_SPEED);
+
+    setMotors(-leftPWM, -rightPWM);
+  }
+
+  smoothStop(-1);
+
+  Serial.print("  encL="); Serial.print(encLeft);
+  Serial.print(" encR="); Serial.println(encRight);
+
+  headingCheck();
+}
+
+// ================================================================
+//  TURNS — encoder speed profile + IMU exit condition
+//
+//  Encoder controls HOW FAST to spin
+//  IMU controls WHEN TO STOP
+// ================================================================
+
+void turnToHeading(float targetHeading, int direction, float degrees) {
+  targetHeading = normalizeAngle(targetHeading);
+  long turnTarget = (long)(COUNTS_PER_DEGREE * degrees);
+
+  resetEncoders();
+
+  unsigned long timeout = millis() + 5000;
+
+  Serial.print("turn "); Serial.print(degrees);
+  Serial.print(" dir="); Serial.println(direction);
+
+  while (millis() < timeout) {
+    float error = angleDiff(targetHeading, getHeading(), direction);
+    if (abs(error) < TURN_TOLERANCE) break;
+
+    // Encoder-based speed profile
+    long encAvg = (abs(encLeft) + abs(encRight)) / 2;
+    int spd = TURN_SPEED;
+
+    long remaining = turnTarget - encAvg;
+    if (remaining < 0) remaining = 0;
+
+    if (remaining < TURN_DECEL) {
+      spd = TURN_MIN + (int)((float)(TURN_SPEED - TURN_MIN) * remaining / TURN_DECEL);
+    }
+
+    if (encAvg < TURN_RAMP) {
+      int rampSpd = TURN_MIN + (int)((float)(TURN_SPEED - TURN_MIN) * encAvg / TURN_RAMP);
+      spd = min(spd, rampSpd);
+    }
+
+    spd = max(spd, TURN_MIN);
+
+    // error > 0 → spin CW (right): left fwd, right back
+    // error < 0 → spin CCW (left): right fwd, left back
+    if (error > 0) setMotors(spd, -spd);
+    else           setMotors(-spd, spd);
+
+    delay(10);
+  }
+
+  stopMotors();
+  delay(50);
+
+  Serial.print("  turn encL="); Serial.print(encLeft);
+  Serial.print(" encR="); Serial.println(encRight);
+
+  headingCheck();
+}
+
+void right(float deg) {
+  missionHeading = normalizeAngle(missionHeading + deg);
+  turnToHeading(missionHeading, 1, deg);
+}
+
+void left(float deg) {
+  missionHeading = normalizeAngle(missionHeading - deg);
+  turnToHeading(missionHeading, -1, deg);
+}
+
+// ================================================================
+//  MISSION
+// ================================================================
+
+void runMission() {
+  fwd(50);
+  d(2);
+  rev(25);
+  d(2);
+  right(90);
+  d(2);
+  left(90);
+  d(2);
+  right(180);
+  d(2);
+  left(180);
+}
+
+// ================================================================
+//  SETUP
+// ================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("Robot Tour v12.0");
+
+  pinMode(MOTOR_A_IN1, OUTPUT);
+  pinMode(MOTOR_A_IN2, OUTPUT);
+  pinMode(MOTOR_B_IN3, OUTPUT);
+  pinMode(MOTOR_B_IN4, OUTPUT);
+  pinMode(MOTOR_A_ENA, OUTPUT);
+  pinMode(MOTOR_B_ENB, OUTPUT);
+
+  pinMode(ENC_LEFT_PIN,  INPUT_PULLUP);
+  pinMode(ENC_RIGHT_PIN, INPUT_PULLUP);
+  pinMode(18, INPUT_PULLUP);
+  pinMode(19, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(ENC_LEFT_PIN),  isrLeft,  CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_RIGHT_PIN), isrRight, CHANGE);
+
+  stopMotors();
+
+  Wire.begin();
+  if (!bno.begin()) {
+    Serial.println("BNO055 FAILED!");
+    while (1) delay(100);
+  }
+
+  bno.setExtCrystalUse(true);
+  delay(1000);
+
+  waitForCalibration();
+
+  missionHeading = getHeading();
+  Serial.print("Start heading: ");
+  Serial.println(missionHeading);
+
+  Serial.println("Mission in 3 sec...");
+  delay(3000);
+  runMission();
+  stopMotors();
+  Serial.println("Done.");
+}
+
+void loop() {}
