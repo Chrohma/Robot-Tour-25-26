@@ -1,19 +1,21 @@
 // ================================================================
 //  ROBOT TOUR — Arduino Mega 2560 + DRI0041 + FIT0186 + BNO055
-//  v12.0 — Clean build: encoder drive + IMU steering + IMU turns
+//  v14.0 — Encoder+IMU fusion, PID headingCheck, smooth braking
 //
-//  VERIFIED HARDWARE (tested 4/7/2026):
-//    Left fwd:  IN1=HIGH, IN2=LOW   → encLeft POSITIVE
-//    Right fwd: IN3=LOW,  IN4=HIGH  → encRight POSITIVE
-//    Left rev:  IN1=LOW,  IN2=HIGH  → encLeft NEGATIVE
-//    Right rev: IN3=HIGH, IN4=LOW   → encRight NEGATIVE
+//  VERIFIED HARDWARE (tested 4/9/2026):
+//    Left fwd:  IN1=HIGH, IN2=LOW   -> encLeft POSITIVE
+//    Right fwd: IN3=LOW,  IN4=HIGH  -> encRight POSITIVE
+//    Left rev:  IN1=LOW,  IN2=HIGH  -> encLeft NEGATIVE
+//    Right rev: IN3=HIGH, IN4=LOW   -> encRight NEGATIVE
 //
-//  SIGN CONVENTIONS (traced and verified):
-//    angleDiff > 0 → target is CW from current → need to turn RIGHT
-//    Turn RIGHT: setMotors(+spd, -spd) → left fwd, right back → CW
-//    Turn LEFT:  setMotors(-spd, +spd) → right fwd, left back → CCW
-//    Steering +  → turn RIGHT → left faster, right slower
-//    Steering -  → turn LEFT  → right faster, left slower
+//  CALIBRATED:
+//    360 spin: 3021 avg counts / 355 degrees = 8.51 counts/degree
+//    Distance: curve fit from mycurvefit.com (R^2 = 0.9991)
+//
+//  ARCHITECTURE:
+//    FWD/REV: encoder PD wheel matching + IMU P heading correction
+//    TURNS:   encoder speed profile + IMU exit condition
+//    HEADING: PID fine-tune after every move
 // ================================================================
 
 #include <Wire.h>
@@ -36,8 +38,7 @@ float missionHeading = 0.0f;
 // === Physical Constants ===
 #define COUNTS_PER_REV     1300.0f
 #define WHEEL_DIAMETER_CM  9.8425f
-#define TRACK_WIDTH_CM     21.55f
-#define COUNTS_PER_DEGREE  7.91f
+#define COUNTS_PER_DEGREE  7.5f
 
 // === Drive Speed ===
 #define DRIVE_SPEED    35
@@ -45,30 +46,40 @@ float missionHeading = 0.0f;
 #define RAMP_UP_COUNTS 200
 #define RAMP_DN_COUNTS 400
 
-// === Steering PID ===
-#define MATCH_KP       1.5f
-#define HEADING_KP     2.0f
+// === Encoder PD (wheel matching — backup, not dominant) ===
+#define ENC_KP         1.5f
+#define ENC_KD         0.3f
+
+// === IMU P (heading correction — dominant authority) ===
+#define HDG_KP         3.5f
+
+// === Combined steering clamp ===
+#define STEER_CLAMP    25
 
 // === Turn ===
 #define TURN_SPEED     25
-#define TURN_MIN       20
-#define TURN_DECEL     200
-#define TURN_RAMP      80
+#define TURN_MIN       18
+#define TURN_RAMP      150
+#define TURN_DECEL     400
 #define TURN_TOLERANCE 1.0f
 
-// === Heading Fix ===
-#define FIX_KP         5.0f
+// === Heading PID ===
+#define FIX_KP         4.0f
+#define FIX_KI         0.5f
+#define FIX_KD         0.3f
 #define FIX_MAX_SPEED  25
 #define FIX_MIN_SPEED  18
+#define FIX_I_CLAMP    30.0f
+#define FIX_TOLERANCE  0.25f
+#define FIX_TIMEOUT    2000
 
 // ================================================================
-//  ENCODERS — verified directions from hardware test
+//  ENCODERS — verified from hardware test
 // ================================================================
 
 volatile long encLeft  = 0;
 volatile long encRight = 0;
 
-// Forward = POSITIVE (verified: encLeft=+3792 during fwd)
 void isrLeft() {
   int a = digitalRead(ENC_LEFT_PIN);
   int b = digitalRead(18);
@@ -76,7 +87,6 @@ void isrLeft() {
   else        encLeft++;
 }
 
-// Forward = POSITIVE (flipped to fix: was -3341 during fwd)
 void isrRight() {
   int a = digitalRead(ENC_RIGHT_PIN);
   int b = digitalRead(19);
@@ -129,8 +139,7 @@ float getHeading() {
   return event.orientation.x;
 }
 
-// direction: 0=auto, +1=force CW, -1=force CCW
-float angleDiff(float target, float current, int direction = 0) {
+float angleDiff(float target, float current, int direction) {
   float diff = target - current;
   while (diff >  180.0f) diff -= 360.0f;
   while (diff < -180.0f) diff += 360.0f;
@@ -138,6 +147,10 @@ float angleDiff(float target, float current, int direction = 0) {
     diff = (direction > 0) ? abs(diff) : -abs(diff);
   }
   return diff;
+}
+
+float angleDiffAuto(float target, float current) {
+  return angleDiff(target, current, 0);
 }
 
 float normalizeAngle(float angle) {
@@ -156,11 +169,18 @@ void waitForCalibration() {
     Serial.print(" gyr:"); Serial.print(gyr);
     Serial.print(" acc:"); Serial.print(acc);
     Serial.print(" mag:"); Serial.println(mag);
-    if (gyr >= 3) { Serial.println("Gyro calibrated!"); break; }
+    if (gyr >= 3) {
+      Serial.println("Gyro calibrated!");
+      break;
+    }
     delay(500);
   }
-  for (int i = 0; i < 20; i++) { getHeading(); delay(50); }
-  Serial.print("Heading settled at: "); Serial.println(getHeading());
+  for (int i = 0; i < 20; i++) {
+    getHeading();
+    delay(50);
+  }
+  Serial.print("Heading settled at: ");
+  Serial.println(getHeading());
 }
 
 // ================================================================
@@ -183,100 +203,178 @@ void resetEncoders() {
 }
 
 // ================================================================
-//  SPEED PROFILE — ramp up at start, ramp down at end
-//  Never goes below MIN_SPEED so motors never stall
+//  SPEED PROFILES
 // ================================================================
 
 int driveSpeed(long avg, long target) {
   int speed = DRIVE_SPEED;
 
-  // Ramp down near target
   long remaining = target - avg;
   if (remaining < RAMP_DN_COUNTS) {
     speed = MIN_SPEED + (int)((float)(DRIVE_SPEED - MIN_SPEED) * remaining / RAMP_DN_COUNTS);
   }
 
-  // Ramp up from start
   if (avg < RAMP_UP_COUNTS) {
     int rampSpeed = MIN_SPEED + (int)((float)(DRIVE_SPEED - MIN_SPEED) * avg / RAMP_UP_COUNTS);
-    speed = min(speed, rampSpeed);
+    if (rampSpeed < speed) speed = rampSpeed;
   }
 
-  return max(speed, MIN_SPEED);
+  if (speed < MIN_SPEED) speed = MIN_SPEED;
+  return speed;
+}
+
+int turnSpeedProfile(long encAvg, long target) {
+  int speed = TURN_SPEED;
+
+  long remaining = target - encAvg;
+  if (remaining < 0) remaining = 0;
+
+  if (remaining < TURN_DECEL) {
+    speed = TURN_MIN + (int)((float)(TURN_SPEED - TURN_MIN) * remaining / TURN_DECEL);
+  }
+
+  if (encAvg < TURN_RAMP) {
+    int rampSpd = TURN_MIN + (int)((float)(TURN_SPEED - TURN_MIN) * encAvg / TURN_RAMP);
+    if (rampSpd < speed) speed = rampSpd;
+  }
+
+  if (speed < TURN_MIN) speed = TURN_MIN;
+  return speed;
 }
 
 // ================================================================
-//  SMOOTH STOP — ramp from MIN_SPEED to 0
+//  SMOOTH STOP — ramp to zero, no jerk
 // ================================================================
 
 void smoothStop(int dir) {
-  // dir: 1 = was driving forward, -1 = was driving reverse
-  for (int s = MIN_SPEED; s > 0; s -= 5) {
+  for (int s = MIN_SPEED; s > 0; s -= 3) {
     setMotors(dir * s, dir * s);
-    delay(15);
+    delay(20);
+  }
+  stopMotors();
+  delay(50);
+}
+
+void smoothTurnStop(int dir) {
+  for (int s = TURN_MIN; s > 0; s -= 3) {
+    if (dir > 0) setMotors(s, -s);
+    else         setMotors(-s, s);
+    delay(20);
   }
   stopMotors();
   delay(50);
 }
 
 // ================================================================
-//  HEADING CHECK — continuous P, quick and powerful
+//  HEADING CHECK — PID fine-tune, 0.25 degree tolerance
+//
+//  P: proportional to error (main correction force)
+//  I: accumulates small persistent error (drives to exactly zero)
+//  D: dampens oscillation (prevents overshoot from PI)
+//  I windup protection: clamped to prevent runaway
+//  Min speed floor: prevents motor stall on tiny corrections
 // ================================================================
 
 void headingCheck() {
   stopMotors();
   delay(50);
 
-  // Flush IMU
-  for (int i = 0; i < 3; i++) { getHeading(); delay(20); }
+  // Flush IMU with fresh reads
+  for (int i = 0; i < 3; i++) {
+    getHeading();
+    delay(20);
+  }
 
-  unsigned long timeout = millis() + 2000;
+  float integral = 0.0f;
+  float prevError = angleDiffAuto(missionHeading, getHeading());
+  unsigned long prevTime = millis();
+  unsigned long timeout = millis() + FIX_TIMEOUT;
+
   while (millis() < timeout) {
-    float error = angleDiff(missionHeading, getHeading());
-    if (abs(error) < 1.0f) break;
+    float error = angleDiffAuto(missionHeading, getHeading());
 
-    // P control with min speed floor so motors don't stall
-    int spd = constrain((int)(FIX_KP * error), -FIX_MAX_SPEED, FIX_MAX_SPEED);
+    // Exit when within tolerance
+    if (abs(error) < FIX_TOLERANCE) break;
+
+    // Time delta
+    unsigned long now = millis();
+    float dt = (now - prevTime) / 1000.0f;
+    if (dt < 0.001f) dt = 0.001f;
+    prevTime = now;
+
+    // PID terms
+    float P = FIX_KP * error;
+
+    // Only accumulate I when error is small (< 5 deg)
+    // Prevents windup during large corrections
+    if (abs(error) < 5.0f) {
+      integral += error * dt;
+    }
+    integral = constrain(integral, -FIX_I_CLAMP, FIX_I_CLAMP);
+    float I = FIX_KI * integral;
+
+    float derivative = (error - prevError) / dt;
+    float D = FIX_KD * derivative;
+    prevError = error;
+
+    // Combine PID
+    int spd = constrain((int)(P + I + D), -FIX_MAX_SPEED, FIX_MAX_SPEED);
+
+    // Min speed floor so motors don't stall
     if (spd > 0 && spd < FIX_MIN_SPEED) spd = FIX_MIN_SPEED;
     if (spd < 0 && spd > -FIX_MIN_SPEED) spd = -FIX_MIN_SPEED;
 
-    // Positive error = need CW = setMotors(+, -)
+    // Positive = CW = setMotors(+, -)
     setMotors(spd, -spd);
     delay(10);
   }
 
   stopMotors();
   delay(50);
+
+  Serial.print("  hdg=");
+  Serial.println(getHeading());
 }
 
 // ================================================================
-//  FWD — encoder distance + encoder match + heading correction
+//  FWD — encoder PD wheel match + IMU heading correction
 //
-//  Steering sign convention (verified):
-//    steering > 0 → turn RIGHT → left faster, right slower
-//    steering < 0 → turn LEFT  → right faster, left slower
+//  Encoder PD: keeps wheels spinning at same rate
+//  IMU P: keeps robot pointed at missionHeading
+//  Both run every iteration, summed into one steering value
 // ================================================================
 
 void fwd(float cm) {
+  cm = 1456.649 + (2.343192 - 1456.649) / (1 + pow(cm / 992.7693, 1.124719));
   long target = cmToCounts(cm);
   resetEncoders();
 
-  Serial.print("fwd "); Serial.print(cm); Serial.println(" cm");
+  long prevDiff = 0;
+
+  Serial.print("fwd ");
+  Serial.print(cm);
+  Serial.println(" cm");
 
   while (((encLeft + encRight) / 2) < target) {
     long avg = (encLeft + encRight) / 2;
     int speed = driveSpeed(avg, target);
 
-    // Encoder matching: left ahead → diff > 0 → steer left → negative
-    float enc_steering = -MATCH_KP * (encLeft - encRight);
+    // --- Encoder PD: match wheel speeds ---
+    long diff = encLeft - encRight;
+    long diffRate = diff - prevDiff;
+    prevDiff = diff;
+    float enc_correction = ENC_KP * diff + ENC_KD * diffRate;
 
-    // Heading: drift right → error < 0 → steer left → negative
-    float heading_steering = HEADING_KP * angleDiff(missionHeading, getHeading());
+    // --- IMU P: hold heading ---
+    float hdgError = angleDiffAuto(missionHeading, getHeading());
+    float hdg_correction = HDG_KP * hdgError;
 
-    int steering = constrain((int)(enc_steering + heading_steering), -15, 15);
+    // Combine: both corrections steer same way
+    // enc_correction > 0 means left ahead, need to slow left = steer left
+    // hdg_correction > 0 means need to turn CW = steer right
+    // So enc subtracts, hdg adds
+    int steering = constrain((int)(-enc_correction + hdg_correction), -STEER_CLAMP, STEER_CLAMP);
 
-    // steering > 0 → left faster (turn right)
-    // steering < 0 → right faster (turn left)
     int leftPWM  = constrain(speed + steering, MIN_SPEED, DRIVE_SPEED);
     int rightPWM = constrain(speed - steering, MIN_SPEED, DRIVE_SPEED);
 
@@ -285,38 +383,51 @@ void fwd(float cm) {
 
   smoothStop(1);
 
-  Serial.print("  encL="); Serial.print(encLeft);
-  Serial.print(" encR="); Serial.println(encRight);
+  Serial.print("  encL=");
+  Serial.print(encLeft);
+  Serial.print(" encR=");
+  Serial.println(encRight);
 
   headingCheck();
 }
 
 // ================================================================
-//  REV — same as fwd but negated, steering sign flipped for reverse
+//  REV — same architecture as fwd, negated drive
 //
-//  In reverse, left faster backward → turns LEFT (opposite of fwd)
-//  So steering sign flips: apply negative steering to get same effect
+//  In reverse, steering geometry flips:
+//    left faster backward = robot turns LEFT (opposite of fwd)
+//  So we negate the steering when applying to motors
 // ================================================================
 
 void rev(float cm) {
+  cm = 1456.649 + (2.343192 - 1456.649) / (1 + pow(cm / 992.7693, 1.124719));
   long target = cmToCounts(cm);
   resetEncoders();
 
-  Serial.print("rev "); Serial.print(cm); Serial.println(" cm");
+  long prevDiff = 0;
+
+  Serial.print("rev ");
+  Serial.print(cm);
+  Serial.println(" cm");
 
   while (abs((encLeft + encRight) / 2) < target) {
     long avg = abs((encLeft + encRight) / 2);
     int speed = driveSpeed(avg, target);
 
-    // Encoder matching using abs values (both encoders negative in rev)
-    float enc_steering = -MATCH_KP * (abs(encLeft) - abs(encRight));
+    // --- Encoder PD: match wheel speeds (use abs since both negative) ---
+    long diff = abs(encLeft) - abs(encRight);
+    long diffRate = diff - prevDiff;
+    prevDiff = diff;
+    float enc_correction = ENC_KP * diff + ENC_KD * diffRate;
 
-    // Heading correction — same calculation
-    float heading_steering = HEADING_KP * angleDiff(missionHeading, getHeading());
+    // --- IMU P: hold heading ---
+    float hdgError = angleDiffAuto(missionHeading, getHeading());
+    float hdg_correction = HDG_KP * hdgError;
 
-    int steering = constrain((int)(enc_steering + heading_steering), -15, 15);
+    // Same steering calculation as fwd
+    int steering = constrain((int)(-enc_correction + hdg_correction), -STEER_CLAMP, STEER_CLAMP);
 
-    // FLIP steering for reverse (left faster backward = turn LEFT, not right)
+    // NEGATE steering for reverse geometry
     int leftPWM  = constrain(speed + steering, MIN_SPEED, DRIVE_SPEED);
     int rightPWM = constrain(speed - steering, MIN_SPEED, DRIVE_SPEED);
 
@@ -325,17 +436,20 @@ void rev(float cm) {
 
   smoothStop(-1);
 
-  Serial.print("  encL="); Serial.print(encLeft);
-  Serial.print(" encR="); Serial.println(encRight);
+  Serial.print("  encL=");
+  Serial.print(encLeft);
+  Serial.print(" encR=");
+  Serial.println(encRight);
 
   headingCheck();
 }
 
 // ================================================================
-//  TURNS — encoder speed profile + IMU exit condition
+//  TURNS — encoder speed + IMU exit
 //
-//  Encoder controls HOW FAST to spin
-//  IMU controls WHEN TO STOP
+//  Encoder: controls speed profile (fast start, smooth decel)
+//  IMU: controls when to stop (within 1 degree of target)
+//  headingCheck: PID fine-tunes to 0.25 degree after stopping
 // ================================================================
 
 void turnToHeading(float targetHeading, int direction, float degrees) {
@@ -346,8 +460,10 @@ void turnToHeading(float targetHeading, int direction, float degrees) {
 
   unsigned long timeout = millis() + 5000;
 
-  Serial.print("turn "); Serial.print(degrees);
-  Serial.print(" dir="); Serial.println(direction);
+  Serial.print("turn ");
+  Serial.print(degrees);
+  Serial.print(" dir=");
+  Serial.println(direction);
 
   while (millis() < timeout) {
     float error = angleDiff(targetHeading, getHeading(), direction);
@@ -355,35 +471,23 @@ void turnToHeading(float targetHeading, int direction, float degrees) {
 
     // Encoder-based speed profile
     long encAvg = (abs(encLeft) + abs(encRight)) / 2;
-    int spd = TURN_SPEED;
+    int spd = turnSpeedProfile(encAvg, turnTarget);
 
-    long remaining = turnTarget - encAvg;
-    if (remaining < 0) remaining = 0;
-
-    if (remaining < TURN_DECEL) {
-      spd = TURN_MIN + (int)((float)(TURN_SPEED - TURN_MIN) * remaining / TURN_DECEL);
-    }
-
-    if (encAvg < TURN_RAMP) {
-      int rampSpd = TURN_MIN + (int)((float)(TURN_SPEED - TURN_MIN) * encAvg / TURN_RAMP);
-      spd = min(spd, rampSpd);
-    }
-
-    spd = max(spd, TURN_MIN);
-
-    // error > 0 → spin CW (right): left fwd, right back
-    // error < 0 → spin CCW (left): right fwd, left back
+    // IMU determines direction
     if (error > 0) setMotors(spd, -spd);
     else           setMotors(-spd, spd);
 
     delay(10);
   }
 
-  stopMotors();
+  // direction matches the turn direction
+  smoothTurnStop(direction);
   delay(50);
 
-  Serial.print("  turn encL="); Serial.print(encLeft);
-  Serial.print(" encR="); Serial.println(encRight);
+  Serial.print("  turn encL=");
+  Serial.print(encLeft);
+  Serial.print(" encR=");
+  Serial.println(encRight);
 
   headingCheck();
 }
@@ -403,16 +507,10 @@ void left(float deg) {
 // ================================================================
 
 void runMission() {
-  fwd(50);
-  d(2);
-  rev(25);
-  d(2);
+  fwd(100);
   right(90);
-  d(2);
   left(90);
-  d(2);
-  right(180);
-  d(2);
+  rev(100);
   left(180);
 }
 
@@ -423,7 +521,7 @@ void runMission() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("Robot Tour v12.0");
+  Serial.println("Robot Tour v14.0 — Encoder+IMU Fusion");
 
   pinMode(MOTOR_A_IN1, OUTPUT);
   pinMode(MOTOR_A_IN2, OUTPUT);
@@ -432,12 +530,12 @@ void setup() {
   pinMode(MOTOR_A_ENA, OUTPUT);
   pinMode(MOTOR_B_ENB, OUTPUT);
 
-  pinMode(ENC_LEFT_PIN,  INPUT_PULLUP);
+  pinMode(ENC_LEFT_PIN, INPUT_PULLUP);
   pinMode(ENC_RIGHT_PIN, INPUT_PULLUP);
   pinMode(18, INPUT_PULLUP);
   pinMode(19, INPUT_PULLUP);
 
-  attachInterrupt(digitalPinToInterrupt(ENC_LEFT_PIN),  isrLeft,  CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_LEFT_PIN), isrLeft, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_RIGHT_PIN), isrRight, CHANGE);
 
   stopMotors();
@@ -464,4 +562,5 @@ void setup() {
   Serial.println("Done.");
 }
 
-void loop() {}
+void loop() {
+}
