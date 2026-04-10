@@ -38,7 +38,7 @@ float missionHeading = 0.0f;
 // === Physical Constants ===
 #define COUNTS_PER_REV     1300.0f
 #define WHEEL_DIAMETER_CM  9.8425f
-#define COUNTS_PER_DEGREE  8.51f
+#define COUNTS_PER_DEGREE  7.5f
 
 // === Drive Speed ===
 #define DRIVE_SPEED    35
@@ -507,11 +507,33 @@ void left(float deg) {
 // ================================================================
 
 void runMission() {
+  fwd(25);
+  left(90);
+  fwd(50);
+  right(90);
+  fwd(150);
+  rev(50);
+  right(90);
+  fwd(50);
+  left(90);
+  fwd(50);
+  right(90);
   fwd(100);
   right(90);
+  fwd(150);
+  rev(50);
   left(90);
-  rev(100);
+  fwd(20);
   left(180);
+  fwd(20);
+  right(90);
+  fwd(50);
+  rev(50);
+  left(90);
+  fwd(100);
+  rev(50);
+  right(90);
+  fwd(50);
 }
 
 // ================================================================
