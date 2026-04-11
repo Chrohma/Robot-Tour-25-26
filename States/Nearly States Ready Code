@@ -57,17 +57,17 @@ float missionHeading = 0.0f;
 #define STEER_CLAMP    25
 
 // === Turn ===
-#define TURN_SPEED     25
+#define TURN_SPEED     37
 #define TURN_MIN       18
 #define TURN_RAMP      150
-#define TURN_DECEL     400
+#define TURN_DECEL     300
 #define TURN_TOLERANCE 1.0f
 
 // === Heading PID ===
-#define FIX_KP         4.0f
-#define FIX_KI         0.5f
-#define FIX_KD         0.3f
-#define FIX_MAX_SPEED  25
+#define FIX_KP         3.67f
+#define FIX_KI         0.1f
+#define FIX_KD         0.28f
+#define FIX_MAX_SPEED  50
 #define FIX_MIN_SPEED  18
 #define FIX_I_CLAMP    30.0f
 #define FIX_TOLERANCE  0.25f
@@ -230,7 +230,7 @@ int turnSpeedProfile(long encAvg, long target) {
   if (remaining < 0) remaining = 0;
 
   if (remaining < TURN_DECEL) {
-    speed = TURN_MIN + (int)((float)(TURN_SPEED - TURN_MIN) * remaining / TURN_DECEL);
+    speed = TURN_MIN + (int)((float)(TURN_SPEED - TURN_MIN) * remaining / TURN_DECEL)-40;
   }
 
   if (encAvg < TURN_RAMP) {
@@ -326,7 +326,12 @@ void headingCheck() {
 
     // Combine PID
     int spd = constrain((int)(P + I + D), -FIX_MAX_SPEED, FIX_MAX_SPEED);
-
+    Serial.print("P:");
+    Serial.print(P);
+    Serial.print("    I:");
+    Serial.print(I);
+    Serial.print("    D:");
+    Serial.println(D);
     // Min speed floor so motors don't stall
     if (spd > 0 && spd < FIX_MIN_SPEED) spd = FIX_MIN_SPEED;
     if (spd < 0 && spd > -FIX_MIN_SPEED) spd = -FIX_MIN_SPEED;
@@ -353,6 +358,7 @@ void headingCheck() {
 
 void fwd(float cm) {
   cm = 5669.521 + (-0.3394784 - 5669.521) / (1 + pow(cm / 4272.084, 1.066098));
+  cm = (0.995169 * cm) - 1.09238;
   long target = cmToCounts(cm);
   resetEncoders();
 
@@ -407,7 +413,8 @@ void fwd(float cm) {
 // ================================================================
 
 void rev(float cm) {
-  cm = 5669.521 + (-0.3394784 - 5669.521) / (1 + pow(cm / 4272.084, 1.066098));
+  // Quartic Regression curve fit
+  cm = (((9.67846e-9 * cm - 0.000008565) * cm + 0.0021339) * cm + 0.875267) * cm - 1.46044;
   long target = cmToCounts(cm);
   resetEncoders();
 
@@ -464,7 +471,7 @@ void turnToHeading(float targetHeading, int direction, float degrees) {
   long turnTarget = (long)(COUNTS_PER_DEGREE * degrees);
 
   resetEncoders();
-
+  /*
   unsigned long timeout = millis() + 5000;
 
   Serial.print("turn ");
@@ -495,7 +502,7 @@ void turnToHeading(float targetHeading, int direction, float degrees) {
   Serial.print(encLeft);
   Serial.print(" encR=");
   Serial.println(encRight);
-
+  */
   headingCheck();
 }
 
@@ -514,39 +521,47 @@ void left(float deg) {
 // ================================================================
 
 void runMission() {
-  int delay = 3;
-  rev(175);
-  d(delay);
-
+  for(int i = 0; i<8;i++){
+    left(90);
+    right(180);
+    left(90);
+  }
+  /*
+  fwd(25);
+  right(90);
+  fwd(50);
+  left(90);
+  fwd(50);
   left(90);
   rev(50);
-  left(90);
-  d(delay);
-
+  right(90);
+  fwd(25);
+  left(180);
+  fwd(75);
   rev(150);
-  d(delay);
-
   right(90);
-  rev(50);
+  fwd(100);
+  left(90);
+  fwd(50);
   right(90);
-
-  rev(100);
-  d(delay);
-  rev(125);
-  d(delay);
-
+  fwd(50);
   left(90);
   rev(50);
   left(90);
-  d(delay);
-
-  rev(100);
-  d(delay);
-  rev(75);
-  d(delay);
   rev(50);
-  d(delay);;
-  rev(25);
+  fwd(50);
+  right(90);
+  fwd(55);
+  right(90);
+  fwd(50);
+  left(90);
+  fwd(95);
+  left(90);
+  fwd(50);
+  rev(50);
+  left(90);
+  fwd(50);
+  */
   }
 
 // ================================================================
