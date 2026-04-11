@@ -68,6 +68,7 @@ float missionHeading = 0.0f;
 #define FIX_KI         0.1f
 #define FIX_KD         0.28f
 #define FIX_MAX_SPEED  50
+#define FIX_CAN_MAX_SPEED 28
 #define FIX_MIN_SPEED  18
 #define FIX_I_CLAMP    30.0f
 #define FIX_TOLERANCE  0.25f
@@ -348,6 +349,80 @@ void headingCheck() {
   Serial.println(getHeading());
 }
 
+
+void headingCheckCan() {
+  stopMotors();
+  delay(50);
+
+  // Flush IMU with fresh reads
+  for (int i = 0; i < 3; i++) {
+    getHeading();
+    delay(20);
+  }
+
+  float integral = 0.0f;
+  float prevError = angleDiffAuto(missionHeading, getHeading());
+  unsigned long prevTime = millis();
+  unsigned long timeout = millis() + FIX_TIMEOUT;
+  int hit = 0;
+  while (millis() < timeout) {
+    float error = angleDiffAuto(missionHeading, getHeading());
+
+    // Exit when within tolerance
+    if (abs(error) < FIX_TOLERANCE) {
+      hit+=1;
+      if(hit>2){
+      break;
+      }
+    }else{
+      hit = 0;
+    }
+
+    // Time delta
+    unsigned long now = millis();
+    float dt = (now - prevTime) / 1000.0f;
+    if (dt < 0.001f) dt = 0.001f;
+    prevTime = now;
+
+    // PID terms
+    float P = FIX_KP * error;
+
+    // Only accumulate I when error is small (< 5 deg)
+    // Prevents windup during large corrections
+    if (abs(error) < 5.0f) {
+      integral += error * dt;
+    }
+    integral = constrain(integral, -FIX_I_CLAMP, FIX_I_CLAMP);
+    float I = FIX_KI * integral;
+
+    float derivative = (error - prevError) / dt;
+    float D = FIX_KD * derivative;
+    prevError = error;
+
+    // Combine PID
+    int spd = constrain((int)(P + I + D), -FIX_CAN_MAX_SPEED, FIX_CAN_MAX_SPEED);
+    Serial.print("P:");
+    Serial.print(P);
+    Serial.print("    I:");
+    Serial.print(I);
+    Serial.print("    D:");
+    Serial.println(D);
+    // Min speed floor so motors don't stall
+    if (spd > 0 && spd < FIX_MIN_SPEED) spd = FIX_MIN_SPEED;
+    if (spd < 0 && spd > -FIX_MIN_SPEED) spd = -FIX_MIN_SPEED;
+
+    // Positive = CW = setMotors(+, -)
+    setMotors(spd, -spd);
+    delay(10);
+  }
+
+  stopMotors();
+  delay(50);
+
+  Serial.print("  hdg=");
+  Serial.println(getHeading());
+}
+
 // ================================================================
 //  FWD — encoder PD wheel match + IMU heading correction
 //
@@ -471,39 +546,17 @@ void turnToHeading(float targetHeading, int direction, float degrees) {
   long turnTarget = (long)(COUNTS_PER_DEGREE * degrees);
 
   resetEncoders();
-  /*
-  unsigned long timeout = millis() + 5000;
 
-  Serial.print("turn ");
-  Serial.print(degrees);
-  Serial.print(" dir=");
-  Serial.println(direction);
-
-  while (millis() < timeout) {
-    float error = angleDiff(targetHeading, getHeading(), direction);
-    if (abs(error) < TURN_TOLERANCE) break;
-
-    // Encoder-based speed profile
-    long encAvg = (abs(encLeft) + abs(encRight)) / 2;
-    int spd = turnSpeedProfile(encAvg, turnTarget);
-
-    // IMU determines direction
-    if (error > 0) setMotors(spd, -spd);
-    else           setMotors(-spd, spd);
-
-    delay(10);
-  }
-
-  // direction matches the turn direction
-  smoothTurnStop(direction);
-  delay(50);
-
-  Serial.print("  turn encL=");
-  Serial.print(encLeft);
-  Serial.print(" encR=");
-  Serial.println(encRight);
-  */
   headingCheck();
+}
+
+void turnToHeadingCan(float targetHeading, int direction, float degrees) {
+  targetHeading = normalizeAngle(targetHeading);
+  long turnTarget = (long)(COUNTS_PER_DEGREE * degrees);
+
+  resetEncoders();
+
+  headingCheckCan();
 }
 
 void right(float deg) {
@@ -516,6 +569,17 @@ void left(float deg) {
   turnToHeading(missionHeading, -1, deg);
 }
 
+void rightC(float deg) {
+  missionHeading = normalizeAngle(missionHeading + deg);
+  turnToHeadingCan(missionHeading, 1, deg);
+}
+
+void leftC(float deg) {
+  missionHeading = normalizeAngle(missionHeading - deg);
+  turnToHeadingCan(missionHeading, -1, deg);
+}
+
+
 // ================================================================
 //  MISSION
 // ================================================================
@@ -523,8 +587,9 @@ void left(float deg) {
 void runMission() {
   for(int i = 0; i<8;i++){
     left(90);
-    right(180);
-    left(90);
+    right(90);
+    leftC(90);
+    rightC(90);
   }
   /*
   fwd(25);
